@@ -5,26 +5,41 @@
     format,
     mono = false,
     lighter = false,
-    truncate = 0
+    plain = false,
+    truncate = 0,
+    maxWidth = '20rem',
+    class: className = '',
+    tooltip,
+    titled = true
   }: {
     row: any;
     value: any;
     format?: (value: any, row: any) => string;
     mono?: boolean;
     lighter?: boolean;
+    plain?: boolean;
     truncate?: number;
+    maxWidth?: string;
+    class?: string;
+    tooltip?: string | ((value: any, row: any) => string | undefined);
+    titled?: boolean;
   } = $props();
 
   const formatted = $derived(format ? format(value, row) : (value ?? ''));
   const isTruncated = $derived(truncate > 0 && typeof formatted === 'string' && formatted.length > truncate);
+  const tooltipText = $derived(typeof tooltip === 'function' ? tooltip(value, row) : tooltip);
+  const toneClass = $derived(plain ? '' : lighter ? 'text-lighter' : 'cell-muted');
 </script>
 
 {#if truncate > 0}
   <span
-    class="{lighter ? 'text-lighter' : 'cell-muted'} {mono ? 'font-mono' : ''}"
-    style="max-width:20rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"
-    title={isTruncated ? formatted : undefined}
+    class="{toneClass} {mono ? 'font-mono' : ''} {className}"
+    style="max-width:{maxWidth};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"
+    title={tooltipText || (isTruncated && titled ? formatted : undefined)}
   >{formatted}</span>
 {:else}
-  <span class="{lighter ? 'text-lighter' : 'cell-muted'} {mono ? 'font-mono' : ''}">{formatted}</span>
+  <span
+    class="{toneClass} {mono ? 'font-mono' : ''} {className}"
+    title={tooltipText}
+  >{formatted}</span>
 {/if}

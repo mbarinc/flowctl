@@ -5,10 +5,12 @@
   import { handleInlineError } from '$lib/utils/errorHandling';
   import { getDefaultNamespace } from '$lib/utils/navigation';
   import { isLoading } from '$lib/stores/auth';
+  import { appInfo } from '$lib/stores/auth';
   import { onMount } from 'svelte';
   import Logo from '$lib/components/shared/Logo.svelte';
   import LoginCard from '$lib/components/login/LoginCard.svelte';
   import ThemeToggle from '$lib/components/shared/ThemeToggle.svelte';
+  import Footer from '$lib/components/shared/Footer.svelte';
 
   let username = $state('');
   let password = $state('');
@@ -49,7 +51,7 @@
 </script>
 
 <svelte:head>
-  <title>Login - Flowctl</title>
+  <title>Login - {$appInfo?.branding?.app_name || "Flowctl"}</title>
 </svelte:head>
 
 <main class="login-page">
@@ -65,9 +67,7 @@
       bind:password
       {redirectUrl}
     />
-    <footer class="mt-6 align-center">
-      <p class="text-lighter text-sm">Need help? Contact your system administrator</p>
-    </footer>
+    <Footer />
   </section>
   <div class="theme-toggle-pos">
     <ThemeToggle collapsed={true} />
@@ -88,6 +88,10 @@
   .login-container {
     width: 100%;
     max-width: 28rem;
+  }
+
+  .login-container :global(.app-footer) {
+    text-align: center;
   }
 
   .theme-toggle-pos {

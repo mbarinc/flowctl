@@ -46,8 +46,15 @@
     >
       {tab.label}
       {#if tab.badge != null}
-        <span class="badge">{tab.badge}</span>
+        <span class="badge primary">{tab.badge}</span>
       {/if}
     </button>
   {/each}
 </div>
+
+<style>
+  [role="tab"] .badge {
+    padding: 0 var(--space-2);
+    line-height: 1.5;
+  }
+</style>

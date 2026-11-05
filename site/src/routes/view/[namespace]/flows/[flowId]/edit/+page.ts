@@ -1,4 +1,5 @@
 import { apiClient } from '$lib/apiClient.js';
+import { resolveSchema } from '$lib/utils/flowBuilder';
 import { permissionChecker } from '$lib/utils/permissions';
 import { error } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
@@ -8,6 +9,7 @@ export const load: PageLoad = async ({ parent }) => {
 
   // Check update and view_config permissions
   let readonly = false;
+  let canViewConfig = false;
   try {
     const permissions = await permissionChecker(user!, 'flow', namespaceId, ['update', 'view_config'], '_');
     if (!permissions.canUpdate && !permissions.canViewConfig) {
@@ -17,6 +19,7 @@ export const load: PageLoad = async ({ parent }) => {
       });
     }
     readonly = !permissions.canUpdate;
+    canViewConfig = permissions.canViewConfig;
   } catch (err) {
     if (err && typeof err === 'object' && 'status' in err) {
       throw err; // Re-throw SvelteKit errors
@@ -38,15 +41,9 @@ export const load: PageLoad = async ({ parent }) => {
       capabilities: info.capabilities,
     }));
 
-    // Resolve $defs/$ref in each messenger schema
     const messengerConfigs: Record<string, any> = {};
     for (const [name, schema] of Object.entries(messengerSchemas)) {
-      if (schema.$defs && schema.$ref) {
-        const refPath = schema.$ref.replace('#/$defs/', '');
-        messengerConfigs[name] = schema.$defs[refPath] || schema;
-      } else {
-        messengerConfigs[name] = schema;
-      }
+      messengerConfigs[name] = resolveSchema(schema);
     }
 
     return {
@@ -54,6 +51,7 @@ export const load: PageLoad = async ({ parent }) => {
       availableMessengers: Object.keys(messengerSchemas),
       messengerConfigs,
       readonly,
+      canViewConfig,
     };
   } catch (loadError) {
     console.error('Error loading executors/messengers:', loadError);
@@ -62,6 +60,7 @@ export const load: PageLoad = async ({ parent }) => {
       availableMessengers: [],
       messengerConfigs: {},
       readonly,
+      canViewConfig,
     };
   }
 };

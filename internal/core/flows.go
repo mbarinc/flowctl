@@ -15,21 +15,71 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/cvhariharan/flowctl/internal/core/execstate"
 	"github.com/cvhariharan/flowctl/internal/core/models"
+	"github.com/cvhariharan/flowctl/internal/expreval"
 	"github.com/cvhariharan/flowctl/internal/repo"
 	"github.com/cvhariharan/flowctl/internal/scheduler"
-	"github.com/expr-lang/expr"
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 	"github.com/sqlc-dev/pqtype"
 )
 
 var (
-	ErrFlowNotFound = errors.New("flow not found")
+	ErrFlowNotFound          = errors.New("flow not found")
+	ErrFlowExists            = errors.New("flow already exists")
+	ErrScheduleNotFound      = errors.New("schedule not found")
+	ErrActionNotFound        = errors.New("action not found")
+	ErrInvalidExecutionState = errors.New("invalid execution state")
 )
+
+// resolveOverrideNodes finds a node-typed input in the flow and resolves its selected
+// names/tags to scheduler nodes. Returns nil if no node input exists or nothing was selected.
+func (c *Core) resolveOverrideNodes(ctx context.Context, f models.Flow, input map[string]any, namespaceUUID uuid.UUID) ([]scheduler.Node, error) {
+	for _, inp := range f.Inputs {
+		if inp.Type != models.INPUT_TYPE_NODE {
+			continue
+		}
+		raw, ok := input[inp.Name]
+		if !ok {
+			continue
+		}
+		targets := toStringSlice(raw)
+		if len(targets) == 0 {
+			continue
+		}
+		nodes, err := models.ResolveTargets(ctx, targets, namespaceUUID, c.GetNodesByNames, c.GetNodesByTags)
+		if err != nil {
+			return nil, err
+		}
+		return models.NodesToScheduler(nodes), nil
+	}
+	return nil, nil
+}
+
+func toStringSlice(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		return t
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, it := range t {
+			if s, ok := it.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		if t == "" {
+			return nil
+		}
+		return []string{t}
+	}
+	return nil
+}
 
 // isSubpath checks if child is under parent (or equal to parent)
 func isSubpath(parent, child string) (bool, error) {
@@ -50,8 +100,8 @@ func isSubpath(parent, child string) (bool, error) {
 	return !strings.HasPrefix(rel, ".."), nil
 }
 
-// detectFlowFormat determines the flow format based on file extension
-func detectFlowFormat(filePath string) models.FlowFormat {
+// DetectFlowFormat determines the flow format based on file extension
+func DetectFlowFormat(filePath string) models.FlowFormat {
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
 	case ".huml":
@@ -78,6 +128,14 @@ func (c *Core) GetFlowByID(id string, namespaceID string) (models.Flow, error) {
 	f, ok := c.flows[fmt.Sprintf("%s:%s", id, namespaceID)]
 	if !ok {
 		return models.Flow{}, ErrFlowNotFound
+	}
+
+	// Clone Inputs so callers can mutate per-input
+	// fields without racing with concurrent readers of the cached flow.
+	if len(f.Inputs) > 0 {
+		inputs := make([]models.Input, len(f.Inputs))
+		copy(inputs, f.Inputs)
+		f.Inputs = inputs
 	}
 
 	return f, nil
@@ -243,23 +301,33 @@ func (c *Core) GetFlowsByPrefix(ctx context.Context, namespaceID, prefix string)
 }
 
 func (c *Core) GetFlowFromLogID(logID string, namespaceID string) (models.Flow, error) {
-	f, ok := c.logMap[logID]
-	if !ok {
-		namespaceUUID, err := uuid.Parse(namespaceID)
-		if err != nil {
-			return models.Flow{}, fmt.Errorf("invalid namespace UUID: %w", err)
-		}
-		df, err := c.store.GetFlowFromExecID(context.Background(), repo.GetFlowFromExecIDParams{
-			ExecID: logID,
-			Uuid:   namespaceUUID,
-		})
-		if err != nil {
-			return models.Flow{}, fmt.Errorf("could not get flow for exec id %s: %w", logID, err)
-		}
-		return c.GetFlowByID(df.Slug, namespaceID)
+	namespaceUUID, err := uuid.Parse(namespaceID)
+	if err != nil {
+		return models.Flow{}, fmt.Errorf("invalid namespace UUID: %w", err)
 	}
-
-	return c.GetFlowByID(f, namespaceID)
+	row, err := c.store.GetExecutionFlowSource(context.Background(), repo.GetExecutionFlowSourceParams{
+		ExecID: logID,
+		Uuid:   namespaceUUID,
+	})
+	if err != nil {
+		return models.Flow{}, fmt.Errorf("could not get flow for exec id %s: %w", logID, err)
+	}
+	current, err := c.GetFlowByID(row.Slug, namespaceID)
+	if err != nil {
+		return models.Flow{}, err
+	}
+	if !row.VersionID.Valid || row.VersionID.Int32 == current.Meta.VersionDBID {
+		return current, nil
+	}
+	// Load the pinned version without replacing c.flows so new runs keep using the active definition.
+	f, err := parseFlowSource([]byte(row.Source.String), models.FlowFormat(row.Format.String), row.NamespaceName, filepath.Base(filepath.Dir(row.FilePath)))
+	if err != nil {
+		return models.Flow{}, fmt.Errorf("flow %s version %d can no longer be loaded: %w", row.Slug, row.Version.Int32, err)
+	}
+	f.Meta.DBID = row.FlowID
+	f.Meta.VersionDBID = row.VersionID.Int32
+	f.Meta.Version = int(row.Version.Int32)
+	return f, nil
 }
 
 // QueueFlowExecution adds a flow in the execution queue. The ID returned is the execution queue ID.
@@ -289,7 +357,7 @@ func (c *Core) QueueFlowExecutionWithExecID(ctx context.Context, f models.Flow, 
 		}
 	}
 
-	info, err := c.queueFlow(ctx, f, input, execID, 0, userUUID, namespaceID, false, scheduledAt)
+	info, err := c.queueFlow(ctx, f, models.NewExecutionContext(input, nil), execID, userUUID, namespaceID, false, nil, scheduledAt)
 	if err != nil {
 		return "", err
 	}
@@ -309,20 +377,14 @@ func (c *Core) ResumeFlowExecution(ctx context.Context, execID string, actionID 
 		return err
 	}
 
-	actionIndex, err := f.GetActionIndexByID(actionID)
-	if err != nil {
-		return err
-	}
-
-	if _, err := c.queueFlow(ctx, f, exec.Input, execID, actionIndex, userUUID, namespaceID, retry, nil); err != nil {
+	if _, err := c.queueFlow(ctx, f, exec.Context, execID, userUUID, namespaceID, true, nil, nil); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// RetryFlowExecution retries a failed or cancelled execution from the point of failure.
-// It automatically detects the retry point from CurrentActionID and resumes execution from there.
+// RetryFlowExecution retries a failed or cancelled execution.
 func (c *Core) RetryFlowExecution(ctx context.Context, execID string, userUUID string, namespaceID string) error {
 	exec, err := c.GetExecutionSummaryByExecID(ctx, execID, namespaceID)
 	if err != nil {
@@ -330,19 +392,78 @@ func (c *Core) RetryFlowExecution(ctx context.Context, execID string, userUUID s
 	}
 
 	if exec.Status != models.ExecutionStatus(repo.ExecutionStatusErrored) && exec.Status != models.ExecutionStatus(repo.ExecutionStatusCancelled) {
-		return fmt.Errorf("execution must be in errored or cancelled state to retry, current status: %s", exec.Status)
+		return fmt.Errorf("%w: execution must be in errored or cancelled state to retry, current status: %s", ErrInvalidExecutionState, exec.Status)
 	}
 
-	if exec.CurrentActionID == "" {
-		return fmt.Errorf("cannot determine retry point - no current action ID")
-	}
-
-	return c.ResumeFlowExecution(ctx, execID, exec.CurrentActionID, userUUID, namespaceID, true)
+	return c.ResumeFlowExecution(ctx, execID, "", userUUID, namespaceID, true)
 }
 
-// queueFlow adds a flow to the execution queue. If the actionIndex is not zero, it is moved to a resume queue.
-// If scheduledAt is provided, the flow will be scheduled to run at that time instead of immediately.
-func (c *Core) queueFlow(ctx context.Context, f models.Flow, input map[string]interface{}, execID string, actionIndex int, userUUID string, namespaceID string, retry bool, scheduledAt *time.Time) (string, error) {
+// RerunFlowExecutionFromAction re-runs an execution from fromActionID, resetting that action and
+// everything downstream of it.
+func (c *Core) RerunFlowExecutionFromAction(ctx context.Context, execID, fromActionID, userUUID, namespaceID string) error {
+	execSummary, err := c.GetExecutionSummaryByExecID(ctx, execID, namespaceID)
+	if err != nil {
+		return fmt.Errorf("could not get exec %s: %w", execID, err)
+	}
+
+	f, err := c.GetFlowFromLogID(execID, namespaceID)
+	if err != nil {
+		return err
+	}
+	resetSet, err := resetActionIDs(f, fromActionID)
+	if err != nil {
+		return err
+	}
+
+	switch execSummary.Status {
+	case models.ExecutionStatus(repo.ExecutionStatusCompleted),
+		models.ExecutionStatus(repo.ExecutionStatusErrored),
+		models.ExecutionStatus(repo.ExecutionStatusCancelled):
+	default:
+		return fmt.Errorf("%w: execution must be terminal to rerun from an action, current status: %s", ErrInvalidExecutionState, execSummary.Status)
+	}
+
+	// Absence is already the pending state, so only append reset events for actions with history.
+	resetActions := make([]string, 0, len(resetSet))
+	for _, actionID := range resetSet {
+		if _, ok := execSummary.ActionStates[actionID]; ok {
+			resetActions = append(resetActions, actionID)
+		}
+	}
+
+	exec, err := c.GetExecutionByExecID(ctx, execID, namespaceID)
+	if err != nil {
+		return fmt.Errorf("could not get exec %s: %w", execID, err)
+	}
+	if _, err := c.queueFlow(ctx, f, exec.Context, execID, userUUID, namespaceID, true, resetActions, nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+func resetActionIDs(f models.Flow, fromActionID string) ([]string, error) {
+	idx, err := f.GetActionIndexByID(fromActionID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrActionNotFound, fromActionID)
+	}
+
+	if !f.Meta.IsDAG() {
+		ids := make([]string, 0, len(f.Actions)-idx)
+		for _, action := range f.Actions[idx:] {
+			ids = append(ids, action.ID)
+		}
+		return ids, nil
+	}
+
+	graph, err := f.Graph()
+	if err != nil {
+		return nil, fmt.Errorf("could not build flow graph: %w", err)
+	}
+	return append([]string{fromActionID}, graph.Descendants(fromActionID)...), nil
+}
+
+// queueFlow creates or requeues an execution and its job atomically.
+func (c *Core) queueFlow(ctx context.Context, f models.Flow, execCtx models.ExecutionContext, execID string, userUUID string, namespaceID string, retry bool, resetActions []string, scheduledAt *time.Time) (string, error) {
 	// If execID is empty, it is a new flow execution
 	if execID == "" {
 		execID = uuid.NewString()
@@ -381,22 +502,26 @@ func (c *Core) queueFlow(ctx context.Context, f models.Flow, input map[string]in
 		dbTriggerType = repo.TriggerTypeScheduled
 	}
 
-	// Create flow execution payload for scheduler
-	payload := scheduler.FlowExecutionPayload{
-		Workflow:          schedulerFlow,
-		Input:             input,
-		StartingActionIdx: actionIndex,
-		NamespaceID:       namespaceID,
-		TriggerType:       triggerType,
-		UserUUID:          userUUID,
-		FlowDirectory:     filepath.Dir(fl.FilePath),
-		Resumed:           retry,
+	overrideNodes, err := c.resolveOverrideNodes(ctx, f, execCtx.Inputs, namespaceUUID)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve override nodes: %w", err)
 	}
 
-	// Create execution log for manual flows before queuing (needed for immediate API calls)
-	inputB, err := json.Marshal(input)
+	// Create flow execution payload for scheduler
+	payload := scheduler.FlowExecutionPayload{
+		Workflow:      schedulerFlow,
+		Input:         execCtx.Inputs,
+		Outputs:       execCtx.Outputs,
+		NamespaceID:   namespaceID,
+		TriggerType:   triggerType,
+		UserUUID:      userUUID,
+		FlowDirectory: filepath.Dir(fl.FilePath),
+		OverrideNodes: overrideNodes,
+	}
+
+	inputs, err := json.Marshal(execCtx.Inputs)
 	if err != nil {
-		return "", fmt.Errorf("could not marshal input to json: %w", err)
+		return "", fmt.Errorf("could not marshal execution context to json: %w", err)
 	}
 
 	// Convert scheduledAt to sql.NullTime for database
@@ -404,56 +529,65 @@ func (c *Core) queueFlow(ctx context.Context, f models.Flow, input map[string]in
 	if scheduledAt != nil {
 		scheduledAtDB = sql.NullTime{Time: *scheduledAt, Valid: true}
 	}
-
-	_, err = c.store.AddExecutionLog(ctx, repo.AddExecutionLogParams{
-		ExecID:      execID,
-		FlowID:      f.Meta.DBID,
-		Input:       inputB,
-		TriggerType: dbTriggerType,
-		Uuid:        userID,
-		Uuid_2:      namespaceUUID,
-		ScheduledAt: scheduledAtDB,
-	})
+	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("could not add entry to execution log: %w", err)
+		return "", fmt.Errorf("could not marshal execution job: %w", err)
+	}
+	job := repo.ExecutionJob{
+		PayloadType: string(scheduler.PayloadTypeFlowExecution),
+		Payload:     payloadJSON,
+		CreatedAt:   time.Now(),
+		MaxRetries:  int32(f.Meta.MaxRetries),
+	}
+	if scheduledAt != nil {
+		if scheduledAt.Before(time.Now()) {
+			return "", fmt.Errorf("scheduled_at must be in the future")
+		}
+		job.ScheduledAt = *scheduledAt
 	}
 
-	// Queue the task using the scheduler
-	maxRetries := f.Meta.MaxRetries
-	if scheduledAt != nil {
-		if maxRetries > 0 {
-			_, err = c.scheduler.QueueScheduledTaskWithRetries(ctx, scheduler.PayloadTypeFlowExecution, execID, payload, *scheduledAt, maxRetries)
-		} else {
-			_, err = c.scheduler.QueueScheduledTask(ctx, scheduler.PayloadTypeFlowExecution, execID, payload, *scheduledAt)
+	if resetActions != nil {
+		if _, err := c.store.ResetActionsAndRequeueTx(ctx, repo.RequeueExecutionParams{ExecID: execID, Uuid: namespaceUUID}, resetActions, job); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", fmt.Errorf("%w: execution is not resettable", ErrInvalidExecutionState)
+			}
+			return "", fmt.Errorf("could not reset and requeue execution: %w", err)
+		}
+	} else if retry {
+		if _, err := c.store.RequeueExecutionAndJobTx(ctx, repo.RequeueExecutionParams{ExecID: execID, Uuid: namespaceUUID}, job); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", fmt.Errorf("%w: execution is not resumable", ErrInvalidExecutionState)
+			}
+			return "", fmt.Errorf("could not requeue execution: %w", err)
 		}
 	} else {
-		if maxRetries > 0 {
-			_, err = c.scheduler.QueueTaskWithRetries(ctx, scheduler.PayloadTypeFlowExecution, execID, payload, maxRetries)
-		} else {
-			_, err = c.scheduler.QueueTask(ctx, scheduler.PayloadTypeFlowExecution, execID, payload)
+		_, err = c.store.QueueExecutionTx(ctx, repo.AddExecutionParams{
+			ExecID: execID, FlowID: f.Meta.DBID, Inputs: inputs, TriggerType: dbTriggerType,
+			Uuid: userID, Uuid_2: namespaceUUID, ScheduledAt: scheduledAtDB,
+			FlowVersionID: nullVersionDBID(f.Meta.VersionDBID),
+		}, execCtx.Outputs, job)
+		if err != nil {
+			return "", fmt.Errorf("could not add execution: %w", err)
 		}
-	}
-	if err != nil {
-		return "", err
 	}
 
 	return execID, nil
 }
 
-// CancelFlowExecution cancels the given execution using the scheduler
-func (c *Core) CancelFlowExecution(ctx context.Context, execID string, namespaceID string) error {
+func (c *Core) CancelFlowExecution(ctx context.Context, execID, namespaceID string) error {
 	namespaceUUID, err := uuid.Parse(namespaceID)
 	if err != nil {
 		return fmt.Errorf("invalid namespace UUID: %w", err)
 	}
 
-	// Update execution status to cancelled in the database
-	_, err = c.store.UpdateExecutionStatus(ctx, repo.UpdateExecutionStatusParams{
-		Status: repo.ExecutionStatusCancelled,
+	_, err = c.store.CancelExecutionTx(ctx, repo.CancelExecutionParams{
 		ExecID: execID,
 		Uuid:   namespaceUUID,
-	})
+	}, "")
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: execution is not cancellable", ErrInvalidExecutionState)
+		}
 		return fmt.Errorf("failed to update execution status: %w", err)
 	}
 
@@ -486,13 +620,6 @@ func (c *Core) GetExecutionSummaryPaginated(ctx context.Context, f models.Flow, 
 	var pageCount, totalCount int64
 
 	for _, v := range execs {
-		actionRetries := make(map[string]int)
-		if v.ActionRetries.Valid {
-			if err := json.Unmarshal(v.ActionRetries.RawMessage, &actionRetries); err != nil {
-				log.Printf("failed to unmarshal action_retries: %v", err)
-			}
-		}
-
 		m = append(m, models.ExecutionSummary{
 			ExecID:          v.ExecID,
 			FlowName:        v.FlowName,
@@ -501,11 +628,10 @@ func (c *Core) GetExecutionSummaryPaginated(ctx context.Context, f models.Flow, 
 			StartedAt:       v.StartedAt.Time,
 			CompletedAt:     v.CompletedAt.Time,
 			TriggerType:     string(v.TriggerType),
+			ScheduleName:    v.ScheduleName,
 			Status:          models.ExecutionStatus(v.Status),
 			TriggeredByName: v.TriggeredByName,
 			TriggeredByID:   v.TriggeredByUuid.String(),
-			CurrentActionID: v.CurrentActionID.String,
-			ActionRetries:   actionRetries,
 			ScheduledAt:     v.ScheduledAt.Time,
 		})
 		pageCount = v.PageCount
@@ -541,13 +667,6 @@ func (c *Core) GetAllExecutionSummaryPaginated(ctx context.Context, namespaceID 
 	var pageCount, totalCount int64
 
 	for _, v := range execs {
-		actionRetries := make(map[string]int)
-		if v.ActionRetries.Valid {
-			if err := json.Unmarshal(v.ActionRetries.RawMessage, &actionRetries); err != nil {
-				log.Printf("failed to unmarshal action_retries: %v", err)
-			}
-		}
-
 		m = append(m, models.ExecutionSummary{
 			ExecID:          v.ExecID,
 			FlowName:        v.FlowName,
@@ -556,11 +675,10 @@ func (c *Core) GetAllExecutionSummaryPaginated(ctx context.Context, namespaceID 
 			StartedAt:       v.StartedAt.Time,
 			CompletedAt:     v.CompletedAt.Time,
 			TriggerType:     string(v.TriggerType),
+			ScheduleName:    v.ScheduleName,
 			Status:          models.ExecutionStatus(v.Status),
 			TriggeredByName: v.TriggeredByName,
 			TriggeredByID:   v.TriggeredByUuid.String(),
-			CurrentActionID: v.CurrentActionID.String,
-			ActionRetries:   actionRetries,
 			ScheduledAt:     v.ScheduledAt.Time,
 		})
 		pageCount = v.PageCount
@@ -583,18 +701,28 @@ func (c *Core) GetExecutionSummaryByExecID(ctx context.Context, execID string, n
 		return models.ExecutionSummary{}, fmt.Errorf("could not get exec %s by exec id: %w", execID, err)
 	}
 
-	// Parse action_retries JSONB
-	actionRetries := make(map[string]int)
-	if e.ActionRetries.Valid {
-		if err := json.Unmarshal(e.ActionRetries.RawMessage, &actionRetries); err != nil {
-			// Log error but don't fail - this is non-critical
-			log.Printf("failed to unmarshal action_retries for exec %s: %v", execID, err)
-		}
+	state, err := c.loadExecutionState(ctx, execID)
+	if err != nil {
+		return models.ExecutionSummary{}, fmt.Errorf("could not load execution state for %s: %w", execID, err)
+	}
+	inputs := make(map[string]any)
+	if err := json.Unmarshal(e.Inputs, &inputs); err != nil {
+		return models.ExecutionSummary{}, fmt.Errorf("could not unmarshal inputs for exec %s: %w", execID, err)
+	}
+	actionRetries := make(map[string]int, len(state.Actions))
+	for id, action := range state.Actions {
+		actionRetries[id] = int(action.Attempt)
 	}
 
+	current, err := c.GetFlowByID(e.FlowSlug, namespaceID)
+	if err != nil {
+		return models.ExecutionSummary{}, err
+	}
 	return models.ExecutionSummary{
+		FlowVersion:     int(e.FlowVersion.Int32),
+		ActiveVersion:   current.Meta.Version,
 		ExecID:          execID,
-		Input:           e.Input,
+		Inputs:          inputs,
 		FlowName:        e.FlowName,
 		FlowID:          e.FlowSlug,
 		Status:          models.ExecutionStatus(e.Status),
@@ -602,33 +730,39 @@ func (c *Core) GetExecutionSummaryByExecID(ctx context.Context, execID string, n
 		StartedAt:       e.StartedAt.Time,
 		CompletedAt:     e.CompletedAt.Time,
 		TriggerType:     string(e.TriggerType),
+		ScheduleName:    e.ScheduleName,
 		TriggeredByName: e.TriggeredByName,
 		TriggeredByID:   e.TriggeredByUuid.String(),
-		CurrentActionID: e.CurrentActionID.String,
+		CurrentActionID: state.CurrentActionID,
 		ActionRetries:   actionRetries,
+		ActionStates:    state.Actions,
 		ScheduledAt:     e.ScheduledAt.Time,
 	}, nil
 }
 
-func (c *Core) GetInputForExec(ctx context.Context, execID string, namespaceID string) (map[string]interface{}, error) {
-	var input map[string]interface{}
+func (c *Core) loadExecutionState(ctx context.Context, execID string) (execstate.ExecutionState, error) {
+	return execstate.LoadState(ctx, c.store, execID)
+}
+
+func (c *Core) GetExecutionContext(ctx context.Context, execID string, namespaceID string) (models.ExecutionContext, error) {
 	namespaceUUID, err := uuid.Parse(namespaceID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid namespace UUID: %w", err)
+		return models.ExecutionContext{}, fmt.Errorf("invalid namespace UUID: %w", err)
 	}
-	in, err := c.store.GetInputForExecByUUID(ctx, repo.GetInputForExecByUUIDParams{
+	execCtxB, err := c.store.GetExecutionContextByUUID(ctx, repo.GetExecutionContextByUUIDParams{
 		ExecID: execID,
 		Uuid:   namespaceUUID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error getting input for %s: %w", execID, err)
+		return models.ExecutionContext{}, fmt.Errorf("error getting context for %s: %w", execID, err)
 	}
 
-	if err := json.Unmarshal(in, &input); err != nil {
-		return nil, fmt.Errorf("error unmarshaling input for %s: %w", execID, err)
+	execCtx, err := models.UnmarshalExecutionContext(execCtxB)
+	if err != nil {
+		return models.ExecutionContext{}, fmt.Errorf("error unmarshaling context for %s: %w", execID, err)
 	}
 
-	return input, nil
+	return execCtx, nil
 }
 
 func (c *Core) GetExecutionByExecID(ctx context.Context, execID string, namespaceID string) (models.Execution, error) {
@@ -644,31 +778,28 @@ func (c *Core) GetExecutionByExecID(ctx context.Context, execID string, namespac
 		return models.Execution{}, fmt.Errorf("could not get execution for exec %s: %w", execID, err)
 	}
 
-	var input map[string]interface{}
-	if err := json.Unmarshal(e.Input, &input); err != nil {
-		return models.Execution{}, fmt.Errorf("error unmarshaling input for %s: %w", execID, err)
+	var inputs, outputs map[string]any
+	if err := json.Unmarshal(e.Inputs, &inputs); err != nil {
+		return models.Execution{}, fmt.Errorf("error unmarshaling inputs for %s: %w", execID, err)
 	}
-
-	u, err := c.store.GetUserByID(ctx, e.TriggeredBy)
-	if err != nil {
-		return models.Execution{}, fmt.Errorf("could not get trigger person for %s: %w", execID, err)
+	if err := json.Unmarshal(e.Outputs, &outputs); err != nil {
+		return models.Execution{}, fmt.Errorf("error unmarshaling outputs for %s: %w", execID, err)
 	}
 
 	return models.Execution{
-		ExecID:      e.ExecID,
-		Version:     int64(e.Version),
-		Input:       input,
-		ErrorMsg:    e.Error.String,
-		TriggeredBy: u.Uuid.String(),
+		ExecID:   e.ExecID,
+		Context:  models.NewExecutionContext(inputs, outputs),
+		ErrorMsg: e.Error.String,
 	}, nil
 }
 
 func (c *Core) CreateFlow(ctx context.Context, f models.Flow, namespaceID string) error {
 	c.rwf.RLock()
-	if _, exists := c.flows[f.Meta.ID]; exists {
-		return fmt.Errorf("flow with id %s already exists", f.Meta.ID)
-	}
+	_, exists := c.flows[fmt.Sprintf("%s:%s", f.Meta.ID, namespaceID)]
 	c.rwf.RUnlock()
+	if exists {
+		return fmt.Errorf("%w: %s", ErrFlowExists, f.Meta.ID)
+	}
 
 	// Remove duplicate schedules
 	f.Schedules = removeDuplicateSchedules(f.Schedules)
@@ -690,7 +821,7 @@ func (c *Core) CreateFlow(ctx context.Context, f models.Flow, namespaceID string
 
 	yamlFilePath := filepath.Join(flowDir, fmt.Sprintf("%s.yaml", f.Meta.ID))
 	if _, err := os.Stat(yamlFilePath); err == nil {
-		return fmt.Errorf("flow with this ID already exists: %w", err)
+		return fmt.Errorf("%w: %s", ErrFlowExists, f.Meta.ID)
 	}
 
 	yamlData, err := models.MarshalFlow(f, models.FlowFormatYAML)
@@ -715,10 +846,11 @@ func (c *Core) CreateFlow(ctx context.Context, f models.Flow, namespaceID string
 
 func (c *Core) UpdateFlow(ctx context.Context, f models.Flow, namespaceID string) error {
 	c.rwf.RLock()
-	if _, exists := c.flows[fmt.Sprintf("%s:%s", f.Meta.ID, namespaceID)]; !exists {
+	_, exists := c.flows[fmt.Sprintf("%s:%s", f.Meta.ID, namespaceID)]
+	c.rwf.RUnlock()
+	if !exists {
 		return fmt.Errorf("flow with id %s does not exist", f.Meta.ID)
 	}
-	c.rwf.RUnlock()
 
 	// Remove duplicate schedules
 	f.Schedules = removeDuplicateSchedules(f.Schedules)
@@ -748,39 +880,24 @@ func (c *Core) UpdateFlow(ctx context.Context, f models.Flow, namespaceID string
 		return fmt.Errorf("flow file does not exist at %s: %w", flowFilePath, err)
 	}
 
-	isSub, err := isSubpath(c.flowDirectory, flowFilePath)
-	if err != nil || !isSub {
-		return fmt.Errorf("cannot write to file outside flows root: %s", flowFilePath)
-	}
-
 	// Detect the format of the existing file and use the same format
-	format := detectFlowFormat(flowFilePath)
+	format := DetectFlowFormat(flowFilePath)
 	flowData, err := models.MarshalFlow(f, format)
 	if err != nil {
 		return fmt.Errorf("could not marshal flow to %s: %w", format, err)
 	}
 
-	if err := os.WriteFile(flowFilePath, flowData, 0644); err != nil {
-		return fmt.Errorf("could not write flow file: %w", err)
-	}
-
-	importedFlow, namespaceUUIDStr, err := c.importFlowFromFile(ctx, flowFilePath, n.Name)
-	if err != nil {
-		return fmt.Errorf("could not import flow after update: %w", err)
-	}
-
-	c.rwf.Lock()
-	defer c.rwf.Unlock()
-	c.flows[fmt.Sprintf("%s:%s", importedFlow.Meta.ID, namespaceUUIDStr)] = importedFlow
-	return nil
+	_, err = c.writeAndImportFlowFile(ctx, flowFilePath, n.Name, flowData)
+	return err
 }
 
 func (c *Core) DeleteFlow(ctx context.Context, flowID, namespaceID string) error {
 	c.rwf.RLock()
-	if _, exists := c.flows[fmt.Sprintf("%s:%s", flowID, namespaceID)]; !exists {
+	_, exists := c.flows[fmt.Sprintf("%s:%s", flowID, namespaceID)]
+	c.rwf.RUnlock()
+	if !exists {
 		return fmt.Errorf("flow with id %s does not exist", flowID)
 	}
-	c.rwf.RUnlock()
 
 	namespaceUUID, err := uuid.Parse(namespaceID)
 	if err != nil {
@@ -917,23 +1034,10 @@ func (c *Core) importFlowFromFile(ctx context.Context, flowFilePath, namespaceNa
 	checksum := hex.EncodeToString(h.Sum(nil))
 
 	// Detect format based on file extension and unmarshal accordingly
-	format := detectFlowFormat(flowFilePath)
-	f, err := models.UnmarshalFlow(data, format)
+	format := DetectFlowFormat(flowFilePath)
+	f, err := parseFlowSource(data, format, namespaceName, filepath.Base(filepath.Dir(flowFilePath)))
 	if err != nil {
 		return models.Flow{}, "", fmt.Errorf("error parsing flow file in %s: %w", flowFilePath, err)
-	}
-
-	if err := f.Validate(); err != nil {
-		return models.Flow{}, "", fmt.Errorf("validation error in %s: %w", flowFilePath, err)
-	}
-
-	f.Meta.SrcDir = filepath.Base(filepath.Dir(flowFilePath))
-	if f.Meta.Namespace == "" {
-		f.Meta.Namespace = namespaceName
-	}
-
-	if f.Meta.Namespace != namespaceName {
-		return models.Flow{}, "", fmt.Errorf("flow namespace %s does not match expected namespace %s", f.Meta.Namespace, namespaceName)
 	}
 
 	ns, err := c.store.GetNamespaceByName(context.Background(), f.Meta.Namespace)
@@ -942,14 +1046,17 @@ func (c *Core) importFlowFromFile(ctx context.Context, flowFilePath, namespaceNa
 	}
 
 	var schedules []struct {
+		Name     string
 		Cron     string
 		Timezone string
 	}
 	for _, sched := range f.Schedules {
 		schedules = append(schedules, struct {
+			Name     string
 			Cron     string
 			Timezone string
 		}{
+			Name:     sched.Name,
 			Cron:     sched.Cron,
 			Timezone: sched.Timezone,
 		})
@@ -1001,6 +1108,17 @@ func (c *Core) importFlowFromFile(ctx context.Context, flowFilePath, namespaceNa
 		return models.Flow{}, "", fmt.Errorf("failed to mark flow %s as active: %w", f.Meta.ID, err)
 	}
 
+	v, err := c.store.EnsureFlowVersion(ctx, repo.EnsureFlowVersionParams{
+		FlowID:   fd.ID,
+		Checksum: checksum,
+		Format:   string(format),
+		Source:   string(data),
+	})
+	if err != nil {
+		return models.Flow{}, "", fmt.Errorf("failed to record version for flow %s: %w", f.Meta.ID, err)
+	}
+	f.Meta.VersionDBID = v.ID
+	f.Meta.Version = int(v.Version)
 	f.Meta.DBID = fd.ID
 	return f, ns.Uuid.String(), nil
 }
@@ -1112,19 +1230,35 @@ func (c *Core) SyncScheduledFlowJobs(ctx context.Context) ([]scheduler.Scheduled
 			}
 		}
 
+		modelFlow, err := c.GetFlowByID(flow.Slug, flow.NamespaceUuid.String())
+		var overrideNodes []scheduler.Node
+		if err == nil {
+			overrideNodes, err = c.resolveOverrideNodes(ctx, modelFlow, input, flow.NamespaceUuid)
+			if err != nil {
+				log.Printf("failed to resolve override nodes for schedule %d: %v", flow.ScheduleID, err)
+				overrideNodes = nil
+			}
+		}
+
 		payload := scheduler.FlowExecutionPayload{
-			Workflow:          schedulerFlow,
-			Input:             input,
-			StartingActionIdx: 0,
-			NamespaceID:       namespace.Uuid.String(),
-			TriggerType:       scheduler.TriggerTypeScheduled,
-			UserUUID:          userUUID,
-			FlowDirectory:     filepath.Dir(flow.FilePath),
+			Workflow:      schedulerFlow,
+			Input:         input,
+			NamespaceID:   namespace.Uuid.String(),
+			TriggerType:   scheduler.TriggerTypeScheduled,
+			ScheduleName:  flow.ScheduleName,
+			UserUUID:      userUUID,
+			FlowDirectory: filepath.Dir(flow.FilePath),
+			OverrideNodes: overrideNodes,
+		}
+
+		jobName := fmt.Sprintf("%s (%s)", flow.Name, flow.Cron)
+		if flow.ScheduleName != "" {
+			jobName = flow.ScheduleName
 		}
 
 		jobs = append(jobs, scheduler.ScheduledJob{
 			ID:          fmt.Sprintf("schedule_%d", flow.ScheduleID),
-			Name:        fmt.Sprintf("%s (%s)", flow.Name, flow.Cron),
+			Name:        jobName,
 			Cron:        flow.Cron,
 			Timezone:    flow.Timezone,
 			PayloadType: scheduler.PayloadTypeFlowExecution,
@@ -1135,7 +1269,7 @@ func (c *Core) SyncScheduledFlowJobs(ctx context.Context) ([]scheduler.Scheduled
 	return jobs, nil
 }
 
-func (c *Core) CreateSchedule(ctx context.Context, flowID, cron, timezone string, inputs map[string]interface{}, userUUID, namespaceID string) (models.Schedule, error) {
+func (c *Core) CreateSchedule(ctx context.Context, flowID, name, cron, timezone string, inputs map[string]interface{}, userUUID, namespaceID string) (models.Schedule, error) {
 	flow, err := c.GetFlowByID(flowID, namespaceID)
 	if err != nil {
 		return models.Schedule{}, fmt.Errorf("flow not found: %w", err)
@@ -1143,6 +1277,10 @@ func (c *Core) CreateSchedule(ctx context.Context, flowID, cron, timezone string
 
 	if !flow.Meta.UserSchedulable {
 		return models.Schedule{}, fmt.Errorf("user schedules are not enabled for this flow")
+	}
+
+	if verr := c.PrepareAndValidateInputs(ctx, &flow, namespaceID, inputs, ""); verr != nil {
+		return models.Schedule{}, verr
 	}
 
 	existing, err := c.store.GetScheduleByFlowAndCron(ctx, repo.GetScheduleByFlowAndCronParams{
@@ -1164,6 +1302,7 @@ func (c *Core) CreateSchedule(ctx context.Context, flowID, cron, timezone string
 
 	schedule, err := c.store.CreateUserSchedule(ctx, repo.CreateUserScheduleParams{
 		FlowID:   flow.Meta.DBID,
+		Name:     name,
 		Cron:     cron,
 		Timezone: timezone,
 		Inputs:   pqtype.NullRawMessage{RawMessage: inputsJSON, Valid: inputsJSON != nil},
@@ -1177,6 +1316,7 @@ func (c *Core) CreateSchedule(ctx context.Context, flowID, cron, timezone string
 		UUID:          schedule.Uuid.String(),
 		FlowSlug:      flow.Meta.ID,
 		FlowName:      flow.Meta.Name,
+		Name:          schedule.Name,
 		Cron:          schedule.Cron,
 		Timezone:      schedule.Timezone,
 		Inputs:        inputs,
@@ -1188,7 +1328,7 @@ func (c *Core) CreateSchedule(ctx context.Context, flowID, cron, timezone string
 	}, nil
 }
 
-func (c *Core) GetSchedule(ctx context.Context, scheduleUUID, userUUID, namespaceID string) (models.Schedule, error) {
+func (c *Core) GetSchedule(ctx context.Context, flowSlug, scheduleUUID, userUUID, namespaceID string) (models.Schedule, error) {
 	userID, err := uuid.Parse(userUUID)
 	if err != nil {
 		return models.Schedule{}, fmt.Errorf("invalid user UUID: %w", err)
@@ -1208,8 +1348,12 @@ func (c *Core) GetSchedule(ctx context.Context, scheduleUUID, userUUID, namespac
 		Uuid:   schedID,
 		Uuid_2: userID,
 		Uuid_3: namespaceUUID,
+		Slug:   flowSlug,
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.Schedule{}, ErrScheduleNotFound
+		}
 		return models.Schedule{}, fmt.Errorf("schedule not found: %w", err)
 	}
 
@@ -1224,6 +1368,7 @@ func (c *Core) GetSchedule(ctx context.Context, scheduleUUID, userUUID, namespac
 		UUID:          schedule.Uuid.String(),
 		FlowSlug:      schedule.FlowSlug,
 		FlowName:      schedule.FlowName,
+		Name:          schedule.Name,
 		Cron:          schedule.Cron,
 		Timezone:      schedule.Timezone,
 		Inputs:        inputs,
@@ -1234,6 +1379,50 @@ func (c *Core) GetSchedule(ctx context.Context, scheduleUUID, userUUID, namespac
 		CreatedAt:     schedule.CreatedAt,
 		UpdatedAt:     schedule.UpdatedAt,
 	}, nil
+}
+
+// GetNextScheduledRuns returns the earliest upcoming run, across both system and user
+// schedules, for each of the given flow slugs that has an active schedule.
+func (c *Core) GetNextScheduledRuns(ctx context.Context, namespaceID string, flowSlugs []string) (map[string]models.NextScheduledRun, error) {
+	if len(flowSlugs) == 0 {
+		return map[string]models.NextScheduledRun{}, nil
+	}
+
+	namespaceUUID, err := uuid.Parse(namespaceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid namespace UUID: %w", err)
+	}
+
+	schedules, err := c.store.GetActiveCronSchedulesByFlowSlugs(ctx, repo.GetActiveCronSchedulesByFlowSlugsParams{
+		Uuid:    namespaceUUID,
+		Column2: flowSlugs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not get active schedules for namespace %s: %w", namespaceID, err)
+	}
+
+	now := time.Now()
+	nextRuns := make(map[string]models.NextScheduledRun, len(schedules))
+	for _, s := range schedules {
+		schedule, err := cron.ParseStandard(s.Cron)
+		if err != nil {
+			log.Printf("skipping invalid cron expression %q for flow %s: %v", s.Cron, s.FlowSlug, err)
+			continue
+		}
+
+		loc, err := time.LoadLocation(s.Timezone)
+		if err != nil {
+			log.Printf("could not load timezone %q for flow %s, using UTC: %v", s.Timezone, s.FlowSlug, err)
+			loc = time.UTC
+		}
+
+		next := schedule.Next(now.In(loc))
+		if existing, ok := nextRuns[s.FlowSlug]; !ok || next.Before(existing.At) {
+			nextRuns[s.FlowSlug] = models.NextScheduledRun{At: next, Name: s.Name}
+		}
+	}
+
+	return nextRuns, nil
 }
 
 // ListSchedules returns a paginated list of all schedules (both user and system schedules)
@@ -1283,6 +1472,7 @@ func (c *Core) ListSchedules(ctx context.Context, flowSlug, userUUID, namespaceI
 			UUID:          s.Uuid.String(),
 			FlowSlug:      s.FlowSlug,
 			FlowName:      s.FlowName,
+			Name:          s.Name,
 			Cron:          s.Cron,
 			Timezone:      s.Timezone,
 			Inputs:        inputs,
@@ -1301,7 +1491,9 @@ func (c *Core) ListSchedules(ctx context.Context, flowSlug, userUUID, namespaceI
 	return result, pageCount, totalCount, nil
 }
 
-func (c *Core) UpdateSchedule(ctx context.Context, scheduleUUID, cron, timezone string, inputs map[string]interface{}, isActive bool, userUUID, namespaceID string) (models.Schedule, error) {
+// UpdateSchedule updates a user-created schedule. A nil name leaves the
+// existing name untouched; an empty non-nil name clears it.
+func (c *Core) UpdateSchedule(ctx context.Context, flowSlug, scheduleUUID string, name *string, cron, timezone string, inputs map[string]interface{}, isActive bool, userUUID, namespaceID string) (models.Schedule, error) {
 	userID, err := uuid.Parse(userUUID)
 	if err != nil {
 		return models.Schedule{}, fmt.Errorf("invalid user UUID: %w", err)
@@ -1321,8 +1513,12 @@ func (c *Core) UpdateSchedule(ctx context.Context, scheduleUUID, cron, timezone 
 		Uuid:   schedID,
 		Uuid_2: userID,
 		Uuid_3: namespaceUUID,
+		Slug:   flowSlug,
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.Schedule{}, ErrScheduleNotFound
+		}
 		return models.Schedule{}, fmt.Errorf("schedule not found: %w", err)
 	}
 
@@ -1335,21 +1531,35 @@ func (c *Core) UpdateSchedule(ctx context.Context, scheduleUUID, cron, timezone 
 		return models.Schedule{}, fmt.Errorf("user schedules are not enabled for this flow")
 	}
 
+	if verr := c.PrepareAndValidateInputs(ctx, &flow, namespaceID, inputs, ""); verr != nil {
+		return models.Schedule{}, verr
+	}
+
 	inputsJSON, err := json.Marshal(inputs)
 	if err != nil {
 		return models.Schedule{}, fmt.Errorf("could not marshal inputs: %w", err)
 	}
 
+	scheduleName := existing.Name
+	if name != nil {
+		scheduleName = *name
+	}
+
 	updated, err := c.store.UpdateUserScheduleByUUID(ctx, repo.UpdateUserScheduleByUUIDParams{
 		Uuid:     schedID,
+		Name:     scheduleName,
 		Cron:     cron,
 		Timezone: timezone,
 		Inputs:   pqtype.NullRawMessage{RawMessage: inputsJSON, Valid: inputsJSON != nil},
 		IsActive: isActive,
 		Uuid_2:   userID,
 		Uuid_3:   namespaceUUID,
+		Slug:     flowSlug,
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return models.Schedule{}, ErrScheduleNotFound
+		}
 		return models.Schedule{}, fmt.Errorf("could not update schedule: %w", err)
 	}
 
@@ -1357,6 +1567,7 @@ func (c *Core) UpdateSchedule(ctx context.Context, scheduleUUID, cron, timezone 
 		UUID:          updated.Uuid.String(),
 		FlowSlug:      existing.FlowSlug,
 		FlowName:      existing.FlowName,
+		Name:          updated.Name,
 		Cron:          updated.Cron,
 		Timezone:      updated.Timezone,
 		Inputs:        inputs,
@@ -1366,7 +1577,7 @@ func (c *Core) UpdateSchedule(ctx context.Context, scheduleUUID, cron, timezone 
 	}, nil
 }
 
-func (c *Core) DeleteSchedule(ctx context.Context, scheduleUUID, userUUID, namespaceID string) error {
+func (c *Core) DeleteSchedule(ctx context.Context, flowSlug, scheduleUUID, userUUID, namespaceID string) error {
 	userID, err := uuid.Parse(userUUID)
 	if err != nil {
 		return fmt.Errorf("invalid user UUID: %w", err)
@@ -1386,13 +1597,14 @@ func (c *Core) DeleteSchedule(ctx context.Context, scheduleUUID, userUUID, names
 		Uuid:   schedID,
 		Uuid_2: userID,
 		Uuid_3: namespaceUUID,
+		Slug:   flowSlug,
 	})
 	if err != nil {
 		return fmt.Errorf("could not delete schedule: %w", err)
 	}
 
 	if rowsAffected == 0 {
-		return fmt.Errorf("schedule not found or permission denied")
+		return ErrScheduleNotFound
 	}
 
 	return nil
@@ -1472,11 +1684,11 @@ func (c *Core) ResolveRemoteOptions(ctx context.Context, ro models.RemoteOptions
 	return result.Options, nil
 }
 
+var headerEvaluator = expreval.New()
+
 // interpolateRemoteHeader evaluates {{ expression }} placeholders in a header
 // value using expr-lang. The available env keys are secrets, inputs, outputs.
 func interpolateRemoteHeader(value string, secrets map[string]string, inputs map[string]interface{}, outputs map[string]interface{}) (string, error) {
-	re := regexp.MustCompile(`{{\s*([^}]+)\s*}}`)
-
 	if inputs == nil {
 		inputs = make(map[string]interface{})
 	}
@@ -1484,45 +1696,11 @@ func interpolateRemoteHeader(value string, secrets map[string]string, inputs map
 		outputs = make(map[string]interface{})
 	}
 
-	var evalErr error
-	result := re.ReplaceAllStringFunc(value, func(match string) string {
-		if evalErr != nil {
-			return ""
-		}
-		sub := re.FindStringSubmatch(match)
-		if len(sub) < 2 {
-			return match
-		}
-		exprStr := strings.TrimSpace(sub[1])
-
-		env := map[string]interface{}{
-			"secrets": secrets,
-			"inputs":  inputs,
-			"outputs": outputs,
-		}
-
-		program, err := expr.Compile(exprStr, expr.Env(env))
-		if err != nil {
-			evalErr = fmt.Errorf("failed to compile header expression %q: %w", exprStr, err)
-			return ""
-		}
-
-		out, err := expr.Run(program, env)
-		if err != nil {
-			evalErr = fmt.Errorf("failed to evaluate header expression %q: %w", exprStr, err)
-			return ""
-		}
-
-		if out == nil {
-			return ""
-		}
-		return fmt.Sprintf("%v", out)
+	return headerEvaluator.Interpolate(value, map[string]any{
+		"secrets": secrets,
+		"inputs":  inputs,
+		"outputs": outputs,
 	})
-
-	if evalErr != nil {
-		return "", evalErr
-	}
-	return result, nil
 }
 
 type remoteOptionsCacheEntry struct {

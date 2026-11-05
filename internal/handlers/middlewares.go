@@ -12,6 +12,33 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+var bindableBodyMediaTypes = map[string]bool{
+	echo.MIMEApplicationJSON: true,
+	echo.MIMEApplicationForm: true,
+	echo.MIMEMultipartForm:   true,
+}
+
+func (h *Handler) RestrictBodyMediaType(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		req := c.Request()
+		if req.ContentLength == 0 {
+			return next(c)
+		}
+
+		contentType := req.Header.Get(echo.HeaderContentType)
+		if contentType == "" {
+			return next(c)
+		}
+
+		base, _, _ := strings.Cut(contentType, ";")
+		if !bindableBodyMediaTypes[strings.TrimSpace(base)] {
+			return wrapError(ErrUnsupportedMediaType, "unsupported content type", nil, nil)
+		}
+
+		return next(c)
+	}
+}
+
 func (h *Handler) Authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		// Check for user API token (PAT). The PAT prefix `fctl_pat_` overlaps the
@@ -130,6 +157,16 @@ func (h *Handler) RequireSessionAuth(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+func (h *Handler) RequirePATAuth(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		method, _ := c.Get("auth_method").(string)
+		if method != "pat" {
+			return wrapError(ErrForbidden, "this endpoint requires api token authentication", nil, nil)
+		}
+		return next(c)
+	}
+}
+
 // authenticateExecutor validates the executor API key from the Authorization header,
 // resolves the user from X-User-UUID, and sets the user in the context.
 // Returns the executor name if valid, or empty string if not an executor request.
@@ -231,6 +268,43 @@ func (h *Handler) AuthorizeNamespaceAction(resource models.Resource, action mode
 				return wrapError(ErrForbidden, "insufficient permissions", nil, nil)
 			}
 
+			return next(c)
+		}
+	}
+}
+
+func (h *Handler) AuthorizeExecutionFlowExecute() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if isExecutor, _ := c.Get("is_executor").(bool); isExecutor {
+				return next(c)
+			}
+
+			user, err := h.getUserInfo(c)
+			if err != nil {
+				return wrapError(ErrAuthenticationFailed, "could not get user details", err, nil)
+			}
+			namespaceID, ok := c.Get("namespace").(string)
+			if !ok {
+				return wrapError(ErrRequiredFieldMissing, "could not get namespace", nil, nil)
+			}
+
+			exec, err := h.co.GetExecutionSummaryByExecID(c.Request().Context(), c.Param("execID"), namespaceID)
+			if err != nil {
+				return wrapError(ErrResourceNotFound, "execution not found", err, nil)
+			}
+			flow, err := h.co.GetFlowByID(exec.FlowID, namespaceID)
+			if err != nil {
+				return wrapError(ErrResourceNotFound, "flow not found", err, nil)
+			}
+
+			allowed, err := h.co.CheckPermission(c.Request().Context(), user.ID, core.FlowDomain(namespaceID, flow.Meta.Prefix), models.ResourceFlow, models.RBACActionExecute)
+			if err != nil {
+				return wrapError(ErrOperationFailed, "could not check permissions", err, nil)
+			}
+			if !allowed {
+				return wrapError(ErrForbidden, "insufficient permissions", nil, nil)
+			}
 			return next(c)
 		}
 	}

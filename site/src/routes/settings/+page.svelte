@@ -5,6 +5,7 @@
 	import UsersTab from '$lib/components/settings/UsersTab.svelte';
 	import GroupsTab from '$lib/components/settings/GroupsTab.svelte';
 	import NamespacesTab from '$lib/components/settings/NamespacesTab.svelte';
+	import { appInfo } from '$lib/stores/auth';
 
 	let { data }: { data: PageData } = $props();
 
@@ -16,7 +17,7 @@
 </script>
 
 <svelte:head>
-	<title>Settings - Flowctl</title>
+	<title>Settings - {$appInfo?.branding?.app_name || "Flowctl"}</title>
 </svelte:head>
 
 <Header breadcrumbs={[{ label: "Settings" }]}>
@@ -30,9 +31,9 @@
 
 	<ot-tabs onot-tab-change={handleTabChange}>
 		<div role="tablist">
-			<button role="tab">Namespaces <span class="badge">{data.namespacesTotalCount}</span></button>
-			<button role="tab" aria-selected="true">Users <span class="badge">{data.usersTotalCount}</span></button>
-			<button role="tab">Groups <span class="badge">{data.groupsTotalCount}</span></button>
+			<button role="tab">Namespaces <span class="badge primary">{data.namespacesTotalCount}</span></button>
+			<button role="tab" aria-selected="true">Users <span class="badge primary">{data.usersTotalCount}</span></button>
+			<button role="tab">Groups <span class="badge primary">{data.groupsTotalCount}</span></button>
 		</div>
 		<div role="tabpanel">
 			<NamespacesTab

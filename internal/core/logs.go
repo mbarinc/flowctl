@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,37 +10,28 @@ import (
 	"encoding/json"
 
 	"github.com/cvhariharan/flowctl/internal/core/models"
-	"github.com/cvhariharan/flowctl/internal/repo"
-	"github.com/google/uuid"
 )
+
+var ExecutionLogPendingTimeout = 30 * time.Second
+
+type LogStreamEndReason string
 
 const (
-	ExecutionLogPendingTimeout = 30 * time.Second
+	LogStreamEndComplete LogStreamEndReason = "complete"
+	LogStreamEndTimeout  LogStreamEndReason = "timeout"
+	LogStreamEndError    LogStreamEndReason = "error"
 )
 
-// getActionRetries loads the action retries map for an execution
 func (c *Core) getActionRetries(ctx context.Context, execID string, namespaceID string) map[string]int32 {
-	namespaceUUID, err := uuid.Parse(namespaceID)
+	state, err := c.loadExecutionState(ctx, execID)
 	if err != nil {
-		log.Printf("invalid namespace UUID for exec %s: %v", execID, err)
+		log.Printf("failed to load action state for exec %s, using empty map: %v", execID, err)
 		return make(map[string]int32)
 	}
 
-	actionRetriesRaw, err := c.store.GetExecutionActionRetries(ctx, repo.GetExecutionActionRetriesParams{
-		ExecID: execID,
-		Uuid:   namespaceUUID,
-	})
-	if err != nil {
-		log.Printf("failed to get action retries for exec %s, using empty map: %v", execID, err)
-		return make(map[string]int32)
-	}
-
-	actionRetries := make(map[string]int32)
-	if actionRetriesRaw.Valid && len(actionRetriesRaw.RawMessage) > 0 {
-		if err := json.Unmarshal(actionRetriesRaw.RawMessage, &actionRetries); err != nil {
-			log.Printf("failed to parse action retries for exec %s, using empty map: %v", execID, err)
-			return make(map[string]int32)
-		}
+	actionRetries := make(map[string]int32, len(state.Actions))
+	for id, action := range state.Actions {
+		actionRetries[id] = action.Attempt
 	}
 
 	return actionRetries
@@ -67,86 +57,88 @@ func (c *Core) DownloadLogs(ctx context.Context, execID string, namespaceID stri
 
 // StreamLogs reads values from a stream from the beginning and returns a channel to which
 // all the messages are sent. logID is the ID sent to the NewFlowExecution task
-func (c *Core) StreamLogs(ctx context.Context, logID string, namespaceID string) (chan models.StreamMessage, error) {
+func (c *Core) StreamLogs(ctx context.Context, logID string, namespaceID string) (<-chan models.StreamMessage, <-chan LogStreamEndReason, error) {
 	ch := make(chan models.StreamMessage)
+	endCh := make(chan LogStreamEndReason, 1)
+	streamCtx, cancel := context.WithCancel(ctx)
 
-	logCh, err := c.streamLogs(ctx, logID, namespaceID)
+	approvalCh, err := c.checkApprovalRequests(streamCtx, logID, namespaceID)
 	if err != nil {
-		return nil, fmt.Errorf("error reading logs for execution %s: %w", logID, err)
+		cancel()
+		return nil, nil, fmt.Errorf("error getting approval requests for execution %s: %w", logID, err)
 	}
 
-	approvalCh, err := c.checkApprovalRequests(ctx, logID, namespaceID)
+	logCh, logEndCh, err := c.streamLogs(streamCtx, logID, namespaceID)
 	if err != nil {
-		return nil, fmt.Errorf("error getting approval requests for execution %s: %w", logID, err)
+		cancel()
+		return nil, nil, fmt.Errorf("error reading logs for execution %s: %w", logID, err)
 	}
 
 	go func(ch chan models.StreamMessage) {
 		defer close(ch)
+		defer close(endCh)
+		defer cancel()
 
-		for approvalCh != nil || logCh != nil {
+		for {
 			select {
-			case <-ctx.Done():
+			case <-streamCtx.Done():
+				return
+			case logReason, ok := <-logEndCh:
+				if !ok {
+					return
+				}
+				endCh <- logReason
 				return
 			case approvalReq, ok := <-approvalCh:
 				if !ok {
 					approvalCh = nil
 					continue
 				}
-				ch <- approvalReq
+				select {
+				case ch <- approvalReq:
+				case <-streamCtx.Done():
+					return
+				}
 			case logMsg, ok := <-logCh:
 				if !ok {
 					logCh = nil
 					continue
 				}
-				ch <- logMsg
+				select {
+				case ch <- logMsg:
+				case <-streamCtx.Done():
+					return
+				}
 			}
 		}
 	}(ch)
 
-	return ch, nil
+	return ch, endCh, nil
 }
 
 // streamLogs reads log messages and results from a stream and writes to a channel
-func (c *Core) streamLogs(ctx context.Context, execID string, namespaceID string) (chan models.StreamMessage, error) {
+func (c *Core) streamLogs(ctx context.Context, execID string, namespaceID string) (<-chan models.StreamMessage, <-chan LogStreamEndReason, error) {
 	ch := make(chan models.StreamMessage)
+	endCh := make(chan LogStreamEndReason, 1)
 
 	go func(ch chan models.StreamMessage) {
-		defer close(ch)
+		defer close(endCh)
 
-		// Wait until logger exists with timeout
-		timeout := time.After(ExecutionLogPendingTimeout)
-
-		// If exec already executed, go to streamloop directly
-		exec, err := c.GetExecutionSummaryByExecID(ctx, execID, namespaceID)
-		if err == nil {
-			if exec.Status == models.ExecutionStatusCompleted ||
-				exec.Status == models.ExecutionStatusErrored ||
-				exec.Status == models.ExecutionStatusCancelled ||
-				exec.Status == models.ExecutionStatusPendingApproval {
-				goto streamLoop
+		if !c.waitForLogger(ctx, execID, namespaceID) {
+			close(ch)
+			if ctx.Err() == nil {
+				log.Printf("timeout waiting for logger %s to be created", execID)
+				endCh <- LogStreamEndTimeout
 			}
+			return
 		}
 
-		// Wait until timeout for running flows
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-timeout:
-				log.Printf("timeout waiting for logger %s to be created, attempting to read archived logs", execID)
-				return
-			default:
-				if c.LogManager.LoggerExists(execID) {
-					goto streamLoop
-				}
-			}
-		}
-
-	streamLoop:
 		actionRetries := c.getActionRetries(ctx, execID, namespaceID)
 		logCh, err := c.LogManager.StreamLogs(ctx, execID, actionRetries)
 		if err != nil {
 			log.Println(err)
+			close(ch)
+			endCh <- LogStreamEndError
 			return
 		}
 
@@ -157,11 +149,53 @@ func (c *Core) streamLogs(ctx context.Context, execID string, namespaceID string
 				continue
 			}
 
-			ch <- sm
+			select {
+			case ch <- sm:
+			case <-ctx.Done():
+				close(ch)
+				return
+			}
 		}
+		close(ch)
+		endCh <- LogStreamEndComplete
 	}(ch)
 
-	return ch, nil
+	return ch, endCh, nil
+}
+
+func (c *Core) waitForLogger(ctx context.Context, execID string, namespaceID string) bool {
+	exec, err := c.GetExecutionSummaryByExecID(ctx, execID, namespaceID)
+	if err == nil {
+		switch exec.Status {
+		case models.ExecutionStatusCompleted,
+			models.ExecutionStatusErrored,
+			models.ExecutionStatusCancelled,
+			models.ExecutionStatusPendingApproval:
+			return true
+		}
+	}
+
+	if c.LogManager.LoggerExists(execID) {
+		return true
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(ExecutionLogPendingTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if c.LogManager.LoggerExists(execID) {
+				return true
+			}
+		}
+	}
 }
 
 func (c *Core) checkApprovalRequests(ctx context.Context, execID string, namespaceID string) (chan models.StreamMessage, error) {
@@ -181,22 +215,42 @@ func (c *Core) checkApprovalRequests(ctx context.Context, execID string, namespa
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
+		// send reports false once the consumer is gone, so a dag execution with several pending
+		// approvals cannot block this goroutine forever.
+		send := func(msg models.StreamMessage) bool {
+			select {
+			case ch <- msg:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
+		rejected := make(map[string]bool)
+
 		for {
-			a, err := c.GetApprovalsRequestsForExec(ctx, execID, namespaceID)
-			if err != nil && !errors.Is(err, ErrNil) {
+			approvals, err := c.GetApprovalRequestsForExec(ctx, execID, namespaceID)
+			if err != nil {
 				log.Println(err)
-				ch <- models.StreamMessage{MType: models.ErrMessageType, Val: err.Error()}
+				send(models.StreamMessage{MType: models.ErrMessageType, Val: err.Error()})
 				return
 			}
 
-			switch a.Status {
-			case "pending":
-				ch <- models.StreamMessage{MType: models.ApprovalMessageType, Val: a.UUID}
-			case "approved":
-				return
-			case "rejected":
-				ch <- models.StreamMessage{MType: models.ErrMessageType, Val: "approval request has been rejected"}
-				return
+			for _, a := range approvals {
+				switch a.Status {
+				case models.ApprovalStatusPending:
+					if !send(models.StreamMessage{MType: models.ApprovalMessageType, Val: a.UUID}) {
+						return
+					}
+				case models.ApprovalStatusRejected:
+					if rejected[a.UUID] {
+						continue
+					}
+					rejected[a.UUID] = true
+					if !send(models.StreamMessage{MType: models.ErrMessageType, Val: "approval request has been rejected"}) {
+						return
+					}
+				}
 			}
 
 			// Wait for 5 seconds

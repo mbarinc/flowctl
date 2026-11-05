@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -26,9 +27,10 @@ const (
 )
 
 type OIDCAuthConfig struct {
-	provider     *oidc.Provider
-	verifier     *oidc.IDTokenVerifier
-	oauth2Config *oauth2.Config
+	provider           *oidc.Provider
+	verifier           *oidc.IDTokenVerifier
+	oauth2Config       *oauth2.Config
+	endSessionEndpoint string
 }
 
 type Handler struct {
@@ -42,6 +44,8 @@ type Handler struct {
 	version            string
 	commit             string
 	buildDate          string
+	hasThemeCSS        bool
+	brandingRoot       *os.Root
 }
 
 func getCookie(name string, r interface{}) (*http.Cookie, error) {
@@ -91,7 +95,32 @@ func NewHandler(logger *slog.Logger, db *sql.DB, co *core.Core, cfg config.Confi
 		}
 	}()
 
-	h := &Handler{co: co, validate: validate, logger: logger, sessMgr: sessMgr, config: cfg, authconfig: make(map[string]OIDCAuthConfig), executorSigningKey: executorSigningKey, version: version, commit: commit, buildDate: buildDate}
+	brandingRoot, err := openBrandingRoot(cfg.App.Branding.BrandingDir)
+	if err != nil {
+		return nil, fmt.Errorf("could not open branding directory: %w", err)
+	}
+
+	hasThemeCSS := false
+	if brandingRoot != nil {
+		if _, err := brandingRoot.Stat("theme.css"); err == nil {
+			hasThemeCSS = true
+		}
+	}
+
+	h := &Handler{
+		co:                 co,
+		validate:           validate,
+		sessMgr:            sessMgr,
+		authconfig:         make(map[string]OIDCAuthConfig),
+		logger:             logger,
+		config:             cfg,
+		executorSigningKey: executorSigningKey,
+		version:            version,
+		commit:             commit,
+		buildDate:          buildDate,
+		hasThemeCSS:        hasThemeCSS,
+		brandingRoot:       brandingRoot,
+	}
 	if err := h.initOIDC(); err != nil {
 		return nil, fmt.Errorf("error initializing oidc config: %w", err)
 	}
@@ -103,11 +132,24 @@ func (h *Handler) HandlePing(c echo.Context) error {
 }
 
 func (h *Handler) HandleGetInfo(c echo.Context) error {
+	var branding *BrandingInfo
+	bc := h.config.App.Branding
+	if bc.AppName != "" || bc.LogoURL != "" || bc.LogoLightURL != "" || bc.FaviconURL != "" || bc.BrandingDir != "" {
+		branding = &BrandingInfo{
+			AppName:      bc.AppName,
+			LogoURL:      bc.LogoURL,
+			LogoLightURL: bc.LogoLightURL,
+			IconURL:      bc.IconURL,
+			FaviconURL:   bc.FaviconURL,
+			HasThemeCSS:  h.hasThemeCSS,
+		}
+	}
 	return c.JSON(http.StatusOK, AppInfoResponse{
 		Version:         h.version,
 		Commit:          h.commit,
 		BuildDate:       h.buildDate,
 		DefaultTimezone: h.config.Scheduler.DefaultTimezone,
+		Branding:        branding,
 	})
 }
 

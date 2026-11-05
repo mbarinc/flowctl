@@ -16,8 +16,8 @@
 	import { DEFAULT_PAGE_SIZE } from '$lib/constants';
 	import Header from '$lib/components/shared/Header.svelte';
 	import { handleInlineError, showSuccess } from '$lib/utils/errorHandling';
-	import { formatDateTime, getStartTime } from '$lib/utils';
-	import { IconHistory } from '@tabler/icons-svelte';
+	import { formatDateTime, formatDuration, getStartTime } from '$lib/utils';
+	import IconHistory from '@tabler/icons-svelte/icons/history';
 
 	let { data }: { data: PageData } = $props();
 	const namespace = $derived(page.params.namespace!);
@@ -108,7 +108,11 @@
 			header: 'Trigger Type',
 			sortable: true,
 			component: BadgeCell,
-			componentProps: { variant: (row: ExecutionSummary) => row.trigger_type === 'manual' ? '' : 'success' }
+			componentProps: {
+				variant: (row: ExecutionSummary) => row.trigger_type === 'manual' ? 'primary' : 'success',
+				tooltip: (row: ExecutionSummary) =>
+					row.trigger_type === 'scheduled' ? row.schedule_name || undefined : undefined
+			}
 		}
 	];
 
@@ -145,27 +149,6 @@
 		fetchExecutions('', currentPage);
 	}
 
-	function formatDuration(startedAt: string, completedAt?: string): string {
-		if (!startedAt) return 'Unknown';
-
-		const start = new Date(startedAt);
-		const end = completedAt ? new Date(completedAt) : new Date();
-		const durationMs = end.getTime() - start.getTime();
-
-		if (durationMs < 1000) return '<1s';
-
-		const seconds = Math.floor(durationMs / 1000);
-		const minutes = Math.floor(seconds / 60);
-		const hours = Math.floor(minutes / 60);
-
-		if (hours > 0) {
-			return `${hours}h ${minutes % 60}m`;
-		} else if (minutes > 0) {
-			return `${minutes}m ${seconds % 60}s`;
-		} else {
-			return `${seconds}s`;
-		}
-	}
 </script>
 
 <svelte:head>

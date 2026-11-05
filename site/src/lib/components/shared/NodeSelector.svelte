@@ -3,21 +3,31 @@
   import { apiClient } from '$lib/apiClient';
   import { handleInlineError } from '$lib/utils/errorHandling';
   import type { NodeResp } from '$lib/types';
-  import { IconChevronDown, IconServer, IconTag, IconX } from '@tabler/icons-svelte';
+  import IconChevronDown from '@tabler/icons-svelte/icons/chevron-down';
+  import IconServer from '@tabler/icons-svelte/icons/server';
+  import IconTag from '@tabler/icons-svelte/icons/tag';
+  import IconX from '@tabler/icons-svelte/icons/x';
 
   let {
     namespace,
     selectedNodes = $bindable([]),
     placeholder = 'Search nodes or use tag:name...',
     disabled = false,
-    multiple = true
+    multiple = true,
+    flowId = ''
   }: {
     namespace: string;
     selectedNodes: string[];
     placeholder?: string;
     disabled?: boolean;
     multiple?: boolean;
+    flowId?: string;
   } = $props();
+
+  const listNodes = (params: { count_per_page?: number; filter?: string; tags?: string[] }) =>
+    flowId
+      ? apiClient.nodes.listForFlow(namespace, flowId, params)
+      : apiClient.nodes.list(namespace, params);
 
   let searchQuery = $state('');
   let searchResults = $state<NodeResp[]>([]);
@@ -47,7 +57,7 @@
 
       if (tagName) {
         try {
-          const response = await apiClient.nodes.list(namespace, { count_per_page: 100, tags: [tagName] });
+          const response = await listNodes({ count_per_page: 100, tags: [tagName] });
           searchResults = response.nodes || [];
         } catch (error) {
           handleInlineError(error, 'Unable to Load Nodes');
@@ -64,7 +74,7 @@
     }
 
     try {
-      const response = await apiClient.nodes.list(namespace, { count_per_page: 100, filter });
+      const response = await listNodes({ count_per_page: 100, filter });
       searchResults = response.nodes || [];
     } catch (error) {
       handleInlineError(error, 'Unable to Load Nodes');
@@ -239,7 +249,7 @@
             {/if}
           </span>
         {:else}
-          <span class="badge hstack gap-1">
+          <span class="badge primary hstack gap-1">
             {nodeName}
             {#if !disabled}
               <button type="button" onclick={() => removeNode(nodeName)} aria-label="Remove {nodeName}" style="all: unset; cursor: pointer; display: flex">

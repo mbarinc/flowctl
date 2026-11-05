@@ -25,6 +25,7 @@ type Config struct {
 	Scheduler  SchedulerConfig  `koanf:"scheduler"`
 	Logger     Logger           `koanf:"logger"`
 	Metrics    Metrics          `koanf:"metrics"`
+	MCP        MCPConfig        `koanf:"mcp"`
 	Messengers MessengersConfig `koanf:"messengers"`
 }
 
@@ -42,9 +43,27 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+const DefaultMaxFlowImportSize = 256 * 1024
+
+const DefaultMCPMaxBodySize = 1024 * 1024
+
 type Metrics struct {
 	Enabled bool   `koanf:"enabled"`
 	Path    string `koanf:"path"`
+}
+
+type MCPConfig struct {
+	Enabled     bool  `koanf:"enabled"`
+	MaxBodySize int64 `koanf:"max_body_size" validate:"min=0"`
+}
+
+type BrandingConfig struct {
+	AppName      string `koanf:"app_name"`
+	LogoURL      string `koanf:"logo_url"`
+	LogoLightURL string `koanf:"logo_light_url"`
+	IconURL      string `koanf:"icon_url"`
+	FaviconURL   string `koanf:"favicon_url"`
+	BrandingDir  string `koanf:"branding_dir"`
 }
 
 type DBConfig struct {
@@ -98,11 +117,14 @@ func (db DBConfig) ConnectionString() string {
 }
 
 type SchedulerConfig struct {
-	WorkerCount          int           `koanf:"workers" validate:"min=1"`
-	Backend              string        `koanf:"backend"`
-	CronSyncInterval     time.Duration `koanf:"cron_sync_interval" validate:"min=1s"`
-	FlowExecutionTimeout time.Duration `koanf:"flow_execution_timeout" validate:"min=1s"`
-	DefaultTimezone      string        `koanf:"default_timezone" validate:"required,timezone"`
+	WorkerCount                int           `koanf:"workers" validate:"min=1"`
+	Backend                    string        `koanf:"backend"`
+	CronSyncInterval           time.Duration `koanf:"cron_sync_interval" validate:"min=1s"`
+	FlowExecutionTimeout       time.Duration `koanf:"flow_execution_timeout" validate:"min=1s"`
+	MaxParallel                int           `koanf:"max_parallel" validate:"min=0"`
+	DefaultTimezone            string        `koanf:"default_timezone" validate:"required,timezone"`
+	ExecutionRetentionTime     time.Duration `koanf:"execution_retention_time" validate:"min=0"`
+	ExecutionRetentionInterval time.Duration `koanf:"execution_retention_interval" validate:"omitempty,min=1m"`
 }
 
 type Logger struct {
@@ -114,16 +136,18 @@ type Logger struct {
 }
 
 type AppConfig struct {
-	AdminUsername     string `koanf:"admin_username" validate:"required,min=1"`
-	AdminPassword     string `koanf:"admin_password" validate:"required,min=8"`
-	RootURL           string `koanf:"root_url" validate:"required,url"`
-	Address           string `koanf:"address" validate:"required"`
-	UseTLS            bool   `koanf:"use_tls"`
-	HTTPTLSCert       string `koanf:"http_tls_cert" validate:"required_if=UseTLS true"`
-	HTTPTLSKey        string `koanf:"http_tls_key" validate:"required_if=UseTLS true"`
-	FlowsDirectory    string `koanf:"flows_directory" validate:"required"`
-	MaxFileUploadSize int64  `koanf:"max_file_upload_size" validate:"required,min=1"`
-	PluginDir         string `koanf:"plugin_dir"`
+	AdminUsername     string         `koanf:"admin_username" validate:"required,min=1"`
+	AdminPassword     string         `koanf:"admin_password" validate:"required,min=8"`
+	RootURL           string         `koanf:"root_url" validate:"required,url"`
+	Address           string         `koanf:"address" validate:"required"`
+	UseTLS            bool           `koanf:"use_tls"`
+	HTTPTLSCert       string         `koanf:"http_tls_cert" validate:"required_if=UseTLS true"`
+	HTTPTLSKey        string         `koanf:"http_tls_key" validate:"required_if=UseTLS true"`
+	FlowsDirectory    string         `koanf:"flows_directory" validate:"required"`
+	MaxFileUploadSize int64          `koanf:"max_file_upload_size" validate:"required,min=1"`
+	MaxFlowImportSize int64          `koanf:"max_flow_import_size" validate:"min=0"`
+	PluginDir         string         `koanf:"plugin_dir"`
+	Branding          BrandingConfig `koanf:"branding"`
 }
 
 type KeystoreConfig struct {
@@ -143,6 +167,8 @@ type OIDCConfig struct {
 	Issuer          string               `koanf:"issuer" validate:"required,url"`
 	AuthURL         string               `koanf:"auth_url" validate:"omitempty,url"`
 	TokenURL        string               `koanf:"token_url" validate:"omitempty,url"`
+	LogoutEnabled   bool                 `koanf:"logout_enabled"`
+	LogoutURL       string               `koanf:"logout_url" validate:"omitempty,url"`
 	RedirectURL     string               `koanf:"redirect_url" validate:"omitempty,url"`
 	ClientID        string               `koanf:"client_id" validate:"required"`
 	ClientSecret    string               `koanf:"client_secret" validate:"required"`
@@ -153,12 +179,18 @@ type OIDCConfig struct {
 type MessengersConfig struct {
 	Email   SMTPConfig    `koanf:"email"`
 	Webhook WebhookConfig `koanf:"webhook"`
+	Chat    ChatConfig    `koanf:"chat"`
 }
 
 type WebhookConfig struct {
 	Enabled    bool          `koanf:"enabled"`
 	SigningKey string        `koanf:"signing_key" validate:"required_if=Enabled true"`
 	Timeout    time.Duration `koanf:"timeout"`
+}
+
+type ChatConfig struct {
+	Enabled bool          `koanf:"enabled"`
+	Timeout time.Duration `koanf:"timeout"`
 }
 
 type SMTPConfig struct {
@@ -197,6 +229,19 @@ func Load(configPath string) (Config, error) {
 		return Config{}, fmt.Errorf("error unmarshaling config: %w", err)
 	}
 
+	if config.App.MaxFlowImportSize <= 0 {
+		config.App.MaxFlowImportSize = DefaultMaxFlowImportSize
+	}
+	if config.MCP.MaxBodySize <= 0 {
+		config.MCP.MaxBodySize = DefaultMCPMaxBodySize
+	}
+	if config.Scheduler.ExecutionRetentionInterval == 0 {
+		config.Scheduler.ExecutionRetentionInterval = time.Hour
+	}
+	if config.Scheduler.MaxParallel <= 0 {
+		config.Scheduler.MaxParallel = runtime.NumCPU()
+	}
+
 	if err := config.Validate(); err != nil {
 		return Config{}, fmt.Errorf("error validating config: %w", err)
 	}
@@ -229,6 +274,7 @@ func GetDefaultConfig() Config {
 			HTTPTLSKey:        "server_key.pem",
 			FlowsDirectory:    "flows",
 			MaxFileUploadSize: 100 * 1024 * 1024, // 100MB
+			MaxFlowImportSize: DefaultMaxFlowImportSize,
 			PluginDir:         "",
 		},
 		Keystore: KeystoreConfig{
@@ -242,16 +288,23 @@ func GetDefaultConfig() Config {
 			},
 		},
 		Scheduler: SchedulerConfig{
-			WorkerCount:          runtime.NumCPU(),
-			CronSyncInterval:     5 * time.Minute,
-			FlowExecutionTimeout: time.Hour,
-			DefaultTimezone:      "UTC",
+			WorkerCount:                runtime.NumCPU(),
+			CronSyncInterval:           5 * time.Minute,
+			FlowExecutionTimeout:       time.Hour,
+			MaxParallel:                runtime.NumCPU(),
+			DefaultTimezone:            "UTC",
+			ExecutionRetentionTime:     0,
+			ExecutionRetentionInterval: time.Hour,
 		},
 		Logger: Logger{
 			Backend:       "file",
 			Directory:     "/var/log/flowctl",
 			RetentionTime: 0,
 			ScanInterval:  1 * time.Hour,
+		},
+		MCP: MCPConfig{
+			Enabled:     false,
+			MaxBodySize: DefaultMCPMaxBodySize,
 		},
 		Messengers: MessengersConfig{
 			Email: SMTPConfig{
@@ -262,6 +315,10 @@ func GetDefaultConfig() Config {
 				SSL:      "none",
 			},
 			Webhook: WebhookConfig{
+				Enabled: false,
+				Timeout: 30 * time.Second,
+			},
+			Chat: ChatConfig{
 				Enabled: false,
 				Timeout: 30 * time.Second,
 			},

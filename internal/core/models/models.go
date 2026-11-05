@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/cvhariharan/flowctl/internal/core/execstate"
 )
 
 type LogMessage struct {
@@ -138,13 +140,46 @@ const (
 	ExecutionStatusErrored         ExecutionStatus = "errored"
 )
 
+// ExecutionContext is the inputs and outputs of an execution.
+type ExecutionContext struct {
+	Inputs  map[string]any `json:"inputs"`
+	Outputs map[string]any `json:"outputs"`
+}
+
+// NewExecutionContext replaces nil maps with empty ones so the stored JSON holds no nulls.
+func NewExecutionContext(inputs, outputs map[string]any) ExecutionContext {
+	if inputs == nil {
+		inputs = make(map[string]any)
+	}
+	if outputs == nil {
+		outputs = make(map[string]any)
+	}
+	return ExecutionContext{Inputs: inputs, Outputs: outputs}
+}
+
+func UnmarshalExecutionContext(b []byte) (ExecutionContext, error) {
+	if len(b) == 0 {
+		return NewExecutionContext(nil, nil), nil
+	}
+
+	var execCtx ExecutionContext
+	if err := json.Unmarshal(b, &execCtx); err != nil {
+		return ExecutionContext{}, fmt.Errorf("could not unmarshal execution context: %w", err)
+	}
+
+	return NewExecutionContext(execCtx.Inputs, execCtx.Outputs), nil
+}
+
 type ExecutionSummary struct {
 	ExecID          string
 	FlowName        string
 	FlowID          string
+	FlowVersion     int // Version pinned to this execution; 0 for legacy executions.
+	ActiveVersion   int // Flow's currently active version, which may differ from the pinned version.
 	Status          ExecutionStatus
-	Input           json.RawMessage
+	Inputs          map[string]any
 	TriggerType     string
+	ScheduleName    string
 	TriggeredByName string
 	TriggeredByID   string
 	CurrentActionID string
@@ -153,6 +188,7 @@ type ExecutionSummary struct {
 	CompletedAt     time.Time
 	ScheduledAt     time.Time
 	ActionRetries   map[string]int
+	ActionStates    map[string]execstate.ActionState
 }
 
 type ScheduledExecution struct {

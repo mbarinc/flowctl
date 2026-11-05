@@ -119,11 +119,23 @@ The `config.toml` file controls all aspects of flowctl's behavior. Here's a comp
   workers = 20
   cron_sync_interval = "5m0s"
   flow_execution_timeout = "1h"
+  max_parallel = 0
+  default_timezone = "UTC"
+  execution_retention_time = "0s"
+  execution_retention_interval = "1h"
 ```
 
 - **`workers`** (required): Number of concurrent workers for executing flows (default: number of CPU threads).
 - **`cron_sync_interval`** (required): How often to sync scheduled flows from the database (default: `5m0s`).
 - **`flow_execution_timeout`** (required): Maximum duration for flow execution before termination (default: `1h`).
+- **`max_parallel`** (optional): Maximum number of actions a single flow in [dag execution mode](/docs/general/flow-execution-modes) runs concurrently. Applies to every flow on the instance. `0` or unset uses the number of CPU cores.
+- **`default_timezone`** (required): Default IANA timezone used to pre-fill the timezone field in the UI when a schedule doesn't set one (default: `UTC`).
+- **`execution_retention_time`** (optional): How long to keep finished executions. Executions in a terminal state older than this are deleted along with their event history and approval records. `0s` keeps them forever.
+- **`execution_retention_interval`** (optional): How often the retention sweep runs (default: `1h`, minimum `1m`).
+
+!!! note
+      `execution_retention_time` only removes rows from the database. Log files are managed
+      separately by `logger.retention_time`, so set both if you want them to expire together.
 
 ### Logger Configuration
 
@@ -170,9 +182,30 @@ Configure SMTP settings to enable email notifications for flow events. Email not
 - **`ssl`** (required): SSL/TLS mode - `none`, `tls` (implicit TLS), or `starttls` (explicit TLS).
 
 !!! note
-      SMTP configuration is required for email notifications to work. See the [Flows
-      documentation](/docs/general/flows#notifications) for how to configure
-      notifications in your flows.
+      SMTP configuration is required for email notifications to work. See the [Flow
+      Notifications documentation](/docs/general/flow-notifications) for how to
+      configure notifications in your flows.
+
+### Chat Notifications
+
+```toml
+[messengers.chat]
+  enabled = true
+  timeout = "30s"
+```
+
+Enable chat notifications to post flow events to Slack or Mattermost. There is nothing to configure
+per instance beyond enabling the messenger. The incoming webhook URL lives in each flow's `notify`
+block, so different flows can post to different channels.
+
+- **`enabled`** (optional): Enable or disable chat notifications (default: `false`).
+- **`timeout`** (optional): HTTP request timeout for delivery (default: `30s`).
+
+!!! note
+      Messages link back to the execution page using `app.root_url`. Set that to the URL users
+      actually reach flowctl on, or the links in chat will be wrong. See the [Chat Notifications
+      documentation](/docs/general/flow-notifications#chat-notifications) for how to configure them
+      in your flows.
 
 ### Webhook Notifications
 
@@ -202,6 +235,8 @@ Configure webhook settings to enable webhook notifications for flow events. Webh
   issuer = "https://your-oidc-provider.com/"
   auth_url = ""
   token_url = ""
+  logout_enabled = false
+  logout_url = ""
   redirect_url = ""
   label = "Sign in with OIDC"
   auto_create_users.enabled = false
@@ -215,7 +250,11 @@ Configure webhook settings to enable webhook notifications for flow events. Webh
       Currently only the default admin user can use a username and password to log
       into flowctl. All other users are expected to use OIDC.
 
-Configure OpenID Connect for single sign-on. Multiple OIDC providers can be configured by adding additional `[[oidc]]` sections:
+Configure OpenID Connect for single sign-on. Multiple OIDC providers can be configured by adding additional `[[oidc]]` sections.
+
+Register `<app.root_url>/auth/callback` as the callback URL in your SSO provider's application settings. If you configure `redirect_url`, register that exact URL instead.
+
+The provider must support the OpenID Connect authorization code flow and return an `id_token` as a signed JWT in its token response. Include the `email` claim in the ID token so flowctl can identify the user. flowctl requests the `openid`, `profile`, and `email` scopes. See [OIDC Authentication](/docs/general/access-control#oidc-authentication) for setup details.
 
 - **`name`** (required): Unique identifier for the OIDC provider.
 - **`client_id`** (required): OAuth2 client ID from your OIDC provider.
@@ -223,7 +262,9 @@ Configure OpenID Connect for single sign-on. Multiple OIDC providers can be conf
 - **`issuer`** (required): OIDC provider's issuer URL.
 - **`auth_url`** (optional): Authorization URL of the OIDC provider.
 - **`token_url`** (optional): Token URL of the OIDC provider.
-- **`redirect_url`** (optional): Callback URL for OIDC authentication.
+- **`logout_enabled`** (optional): Also end the SSO provider session when logging out of flowctl (default: `false`). Uses the provider's discovered logout endpoint or `logout_url`. If neither is available, only the flowctl session is ended.
+- **`logout_url`** (optional): Override the provider's discovered logout endpoint. Only used when `logout_enabled` is `true`.
+- **`redirect_url`** (optional): Callback URL for OIDC authentication (default: `<app.root_url>/auth/callback`).
 - **`label`** (optional): Label for the SSO button.
 - **`auto_create_users.enabled`** (optional): Automatically create a flowctl account for users logging in for the first time (default: `false`). See [Auto-Creating Users on Login](/docs/general/access-control#auto-creating-users-on-login).
 - **`auto_create_users.namespace`** (optional): Namespace to add new users to (default: `"default"`).

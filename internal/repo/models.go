@@ -142,6 +142,59 @@ func (ns NullConnectionType) Value() (driver.Value, error) {
 	return string(ns.ConnectionType), nil
 }
 
+type ExecutionEventType string
+
+const (
+	ExecutionEventTypeQueued          ExecutionEventType = "queued"
+	ExecutionEventTypeStarted         ExecutionEventType = "started"
+	ExecutionEventTypeWaitingApproval ExecutionEventType = "waiting_approval"
+	ExecutionEventTypeCompleted       ExecutionEventType = "completed"
+	ExecutionEventTypeErrored         ExecutionEventType = "errored"
+	ExecutionEventTypeCancelled       ExecutionEventType = "cancelled"
+	ExecutionEventTypeActionStarted   ExecutionEventType = "action_started"
+	ExecutionEventTypeActionCompleted ExecutionEventType = "action_completed"
+	ExecutionEventTypeActionFailed    ExecutionEventType = "action_failed"
+	ExecutionEventTypeActionBlocked   ExecutionEventType = "action_blocked"
+	ExecutionEventTypeActionSkipped   ExecutionEventType = "action_skipped"
+	ExecutionEventTypeActionCancelled ExecutionEventType = "action_cancelled"
+	ExecutionEventTypeActionReset     ExecutionEventType = "action_reset"
+)
+
+func (e *ExecutionEventType) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ExecutionEventType(s)
+	case string:
+		*e = ExecutionEventType(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ExecutionEventType: %T", src)
+	}
+	return nil
+}
+
+type NullExecutionEventType struct {
+	ExecutionEventType ExecutionEventType `json:"execution_event_type"`
+	Valid              bool               `json:"valid"` // Valid is true if ExecutionEventType is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullExecutionEventType) Scan(value interface{}) error {
+	if value == nil {
+		ns.ExecutionEventType, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ExecutionEventType.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullExecutionEventType) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ExecutionEventType), nil
+}
+
 type ExecutionStatus string
 
 const (
@@ -329,13 +382,13 @@ type ApiToken struct {
 type Approval struct {
 	ID          int32          `db:"id" json:"id"`
 	Uuid        uuid.UUID      `db:"uuid" json:"uuid"`
-	ExecLogID   int32          `db:"exec_log_id" json:"exec_log_id"`
 	ActionID    string         `db:"action_id" json:"action_id"`
 	Status      ApprovalStatus `db:"status" json:"status"`
 	DecidedBy   sql.NullInt32  `db:"decided_by" json:"decided_by"`
 	NamespaceID int32          `db:"namespace_id" json:"namespace_id"`
 	CreatedAt   time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt   time.Time      `db:"updated_at" json:"updated_at"`
+	ExecID      string         `db:"exec_id" json:"exec_id"`
 }
 
 type CasbinRule struct {
@@ -373,26 +426,39 @@ type CronSchedule struct {
 	CreatedBy     int32                 `db:"created_by" json:"created_by"`
 	IsUserCreated bool                  `db:"is_user_created" json:"is_user_created"`
 	IsActive      bool                  `db:"is_active" json:"is_active"`
+	Name          string                `db:"name" json:"name"`
 }
 
-type ExecutionLog struct {
-	ID              int32                 `db:"id" json:"id"`
-	ExecID          string                `db:"exec_id" json:"exec_id"`
-	FlowID          int32                 `db:"flow_id" json:"flow_id"`
-	Version         int32                 `db:"version" json:"version"`
-	Input           json.RawMessage       `db:"input" json:"input"`
-	Error           sql.NullString        `db:"error" json:"error"`
-	CurrentActionID sql.NullString        `db:"current_action_id" json:"current_action_id"`
-	Status          ExecutionStatus       `db:"status" json:"status"`
-	TriggerType     TriggerType           `db:"trigger_type" json:"trigger_type"`
-	TriggeredBy     int32                 `db:"triggered_by" json:"triggered_by"`
-	NamespaceID     int32                 `db:"namespace_id" json:"namespace_id"`
-	CreatedAt       time.Time             `db:"created_at" json:"created_at"`
-	UpdatedAt       time.Time             `db:"updated_at" json:"updated_at"`
-	CompletedAt     sql.NullTime          `db:"completed_at" json:"completed_at"`
-	ActionRetries   pqtype.NullRawMessage `db:"action_retries" json:"action_retries"`
-	ScheduledAt     sql.NullTime          `db:"scheduled_at" json:"scheduled_at"`
-	StartedAt       sql.NullTime          `db:"started_at" json:"started_at"`
+type Execution struct {
+	ID            int32           `db:"id" json:"id"`
+	ExecID        string          `db:"exec_id" json:"exec_id"`
+	FlowID        int32           `db:"flow_id" json:"flow_id"`
+	NamespaceID   int32           `db:"namespace_id" json:"namespace_id"`
+	TriggeredBy   int32           `db:"triggered_by" json:"triggered_by"`
+	TriggerType   TriggerType     `db:"trigger_type" json:"trigger_type"`
+	Inputs        json.RawMessage `db:"inputs" json:"inputs"`
+	ScheduledAt   sql.NullTime    `db:"scheduled_at" json:"scheduled_at"`
+	CreatedAt     time.Time       `db:"created_at" json:"created_at"`
+	Attempt       int32           `db:"attempt" json:"attempt"`
+	Status        ExecutionStatus `db:"status" json:"status"`
+	Error         sql.NullString  `db:"error" json:"error"`
+	Outputs       json.RawMessage `db:"outputs" json:"outputs"`
+	StartedAt     sql.NullTime    `db:"started_at" json:"started_at"`
+	CompletedAt   sql.NullTime    `db:"completed_at" json:"completed_at"`
+	UpdatedAt     time.Time       `db:"updated_at" json:"updated_at"`
+	ScheduleName  string          `db:"schedule_name" json:"schedule_name"`
+	FlowVersionID sql.NullInt32   `db:"flow_version_id" json:"flow_version_id"`
+}
+
+type ExecutionEvent struct {
+	Seq       int64                 `db:"seq" json:"seq"`
+	ExecID    string                `db:"exec_id" json:"exec_id"`
+	Attempt   int32                 `db:"attempt" json:"attempt"`
+	ActionID  sql.NullString        `db:"action_id" json:"action_id"`
+	Type      ExecutionEventType    `db:"type" json:"type"`
+	Error     sql.NullString        `db:"error" json:"error"`
+	Outputs   pqtype.NullRawMessage `db:"outputs" json:"outputs"`
+	CreatedAt time.Time             `db:"created_at" json:"created_at"`
 }
 
 type ExecutorKvStore struct {
@@ -439,6 +505,16 @@ type FlowSecret struct {
 	NamespaceID    int32          `db:"namespace_id" json:"namespace_id"`
 	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
+}
+
+type FlowVersion struct {
+	ID        int32     `db:"id" json:"id"`
+	FlowID    int32     `db:"flow_id" json:"flow_id"`
+	Version   int32     `db:"version" json:"version"`
+	Checksum  string    `db:"checksum" json:"checksum"`
+	Format    string    `db:"format" json:"format"`
+	Source    string    `db:"source" json:"source"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
 type Group struct {

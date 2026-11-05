@@ -30,6 +30,7 @@
   function getInitialFormData() {
     if (isEditMode && schedule) {
       return {
+        name: schedule.name,
         cron: schedule.cron,
         timezone: schedule.timezone,
         is_active: schedule.is_active,
@@ -38,18 +39,23 @@
     }
     // Initialize inputs with defaults for create mode
     const initialInputs: Record<string, any> = {};
-    flowInputs.forEach(input => {
+    scheduleInputs.forEach(input => {
       if (input.default) {
         initialInputs[input.name] = input.default;
       }
     });
     return {
+      name: '',
       cron: '',
       timezone: get(appInfo)?.default_timezone ?? 'UTC',
       is_active: true,
       inputs: initialInputs
     };
   }
+
+  const scheduleInputs = flowInputs.map(input =>
+    input.default_dynamic ? { ...input, default: undefined } : input
+  );
 
   let formData = $state(getInitialFormData());
   let loading = $state(false);
@@ -108,6 +114,19 @@
 
     <section>
       <div data-field>
+        <label for="schedule-name">Name</label>
+        <input
+          id="schedule-name"
+          type="text"
+          bind:value={formData.name}
+          maxlength="150"
+          placeholder="Cron name"
+          use:autofocus
+        />
+        <p class="text-lighter text-xs" style="margin-top: 0.25rem">Up to 150 characters</p>
+      </div>
+
+      <div data-field>
         <label for="cron-expr">Cron Expression *</label>
         <input
           id="cron-expr"
@@ -117,7 +136,6 @@
           aria-invalid={cronError ? 'true' : undefined}
           placeholder="0 2 * * *"
           required
-          use:autofocus
         />
         {#if cronError}
           <p style="color: var(--danger); margin-top: 0.25rem" class="text-sm">{cronError}</p>
@@ -159,7 +177,7 @@
       {#if flowInputs.length > 0}
         <div class="inputs-section">
           <h3 class="text-sm font-medium">Flow Inputs</h3>
-          <FlowInputFields inputs={flowInputs} bind:values={formData.inputs} />
+          <FlowInputFields inputs={scheduleInputs} bind:values={formData.inputs} {namespace} {flowId} />
         </div>
       {/if}
     </section>

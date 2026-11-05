@@ -3,7 +3,10 @@
     import { handleInlineError } from "$lib/utils/errorHandling";
     import OatSelect from "$lib/components/shared/OatSelect.svelte";
     import type { User, Group } from "$lib/types";
-    import { IconUsers, IconUser, IconX, IconMail } from "@tabler/icons-svelte";
+    import IconUsers from "@tabler/icons-svelte/icons/users";
+    import IconUser from "@tabler/icons-svelte/icons/user";
+    import IconX from "@tabler/icons-svelte/icons/x";
+    import IconMail from "@tabler/icons-svelte/icons/mail";
 
     let {
         selectedReceivers = $bindable([]),
@@ -225,7 +228,7 @@
     {#if selectedItems.length > 0}
         <div class="hstack" style="flex-wrap: wrap; gap: 0.5rem">
             {#each selectedItems as item, index (item.value)}
-                <span class="badge hstack gap-1">
+                <span class="badge primary hstack gap-1">
                     {#if item.type === "user"}
                         <IconUser size={12} />
                     {:else}

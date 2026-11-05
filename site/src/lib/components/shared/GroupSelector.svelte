@@ -2,7 +2,9 @@
   import { apiClient } from '$lib/apiClient';
   import { handleInlineError } from '$lib/utils/errorHandling';
   import type { Group } from '$lib/types';
-  import { IconChevronDown, IconUsersGroup, IconX } from '@tabler/icons-svelte';
+  import IconChevronDown from '@tabler/icons-svelte/icons/chevron-down';
+  import IconUsersGroup from '@tabler/icons-svelte/icons/users-group';
+  import IconX from '@tabler/icons-svelte/icons/x';
 
   let {
     selectedGroups = $bindable([]),
@@ -175,7 +177,7 @@
   {#if selectedGroups.length > 0}
     <div class="hstack mt-2" style="flex-wrap: wrap; gap: 0.25rem">
       {#each selectedGroups as group (group.id)}
-        <span class="badge hstack gap-1">
+        <span class="badge primary hstack gap-1">
           {group.name}
           {#if !disabled}
             <button type="button" onclick={() => removeGroup(group.id)} aria-label="Remove {group.name}" style="all: unset; cursor: pointer; display: flex">

@@ -24,6 +24,16 @@ export interface AppInfoResponse {
   commit: string;
   build_date: string;
   default_timezone: string;
+  branding?: BrandingInfo;
+}
+
+export interface BrandingInfo {
+  app_name?: string;
+  logo_url?: string;
+  logo_light_url?: string;
+  icon_url?: string;
+  favicon_url?: string;
+  has_theme_css?: boolean;
 }
 
 export interface AuthReq {
@@ -50,6 +60,7 @@ export interface GroupWithUsers extends Group {
 
 // Flow types
 export interface Schedule {
+  name?: string;
   cron: string;
   timezone: string;
 }
@@ -58,6 +69,7 @@ export interface UserSchedule {
   uuid: string;
   flow_slug: string;
   flow_name: string;
+  name: string;
   cron: string;
   timezone: string;
   inputs: Record<string, any>;
@@ -69,6 +81,7 @@ export interface UserSchedule {
 }
 
 export interface ScheduleCreateReq {
+  name?: string;
   cron: string;
   timezone: string;
   inputs: Record<string, any>;
@@ -76,6 +89,7 @@ export interface ScheduleCreateReq {
 }
 
 export interface ScheduleUpdateReq {
+  name?: string;
   cron?: string;
   timezone?: string;
   inputs?: Record<string, any>;
@@ -90,7 +104,7 @@ export interface SchedulesPaginateResponse {
 
 export interface Notify {
   channel: string;
-  receivers: string[];
+  config: Record<string, any>;
   events: string[];
 }
 
@@ -108,6 +122,8 @@ export interface FlowListItem {
   prefix: string;
   schedules: Schedule[];
   step_count: number;
+  next_run?: string;
+  next_run_name?: string;
 }
 
 export interface FlowInput {
@@ -122,9 +138,12 @@ export interface FlowInput {
     | "file"
     | "datetime"
     | "checkbox"
-    | "select";
+    | "select"
+    | "node";
   options: string[];
   default?: string;
+  default_dynamic?: boolean;
+  multiple?: boolean;
   max_file_size?: number;
 }
 
@@ -134,6 +153,7 @@ export interface FlowInputsResp {
 }
 
 export interface FlowMeta {
+  version?: number;
   id: string;
   name: string;
   description: string;
@@ -143,14 +163,19 @@ export interface FlowMeta {
   allow_overlap: boolean;
   user_schedulable: boolean;
   max_retries: number;
+  execution_mode?: ExecutionMode;
 }
+
+export type ExecutionMode = "sequential" | "dag";
 
 export interface FlowAction {
   id: string;
   name: string;
   executor: string;
   approval: boolean;
+  allow_node_override?: boolean;
   on: string[];
+  needs?: string[];
 }
 
 export interface ScheduledExecution {
@@ -299,6 +324,7 @@ export interface ApprovalDetailsResp {
   inputs?: any;
   flow_name: string;
   flow_id: string;
+  flow_version?: number;
   requested_by: string;
   approved_by?: string;
   created_at: string;
@@ -315,11 +341,14 @@ export type ExecutionStatus =
   | "running";
 
 export interface ExecutionSummary {
+  flow_version?: number;
+  active_version?: number;
   id: string;
   flow_name: string;
   flow_id: string;
   status: ExecutionStatus;
   trigger_type: string;
+  schedule_name?: string;
   input?: any;
   triggered_by: string;
   current_action_id: string;
@@ -329,6 +358,23 @@ export interface ExecutionSummary {
   duration: string;
   scheduled_at?: string;
   action_retries?: Record<string, number>;
+  action_states?: Record<string, ActionState>;
+}
+
+export type ActionStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "blocked"
+  | "cancelled";
+
+export interface ActionState {
+  status: ActionStatus;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
 }
 
 // Pagination types
@@ -521,7 +567,9 @@ export interface FlowMetaReq {
   prefix?: string;
   schedules?: Schedule[];
   allow_overlap?: boolean;
+  user_schedulable?: boolean;
   max_retries?: number;
+  execution_mode?: ExecutionMode;
 }
 
 export interface RemoteOptionsReq {
@@ -539,26 +587,31 @@ export interface FlowInputReq {
     | "file"
     | "datetime"
     | "checkbox"
-    | "select";
+    | "select"
+    | "node";
   label?: string;
   description?: string;
   validation?: string;
   required?: boolean;
   default?: string;
   options?: string[];
+  multiple?: boolean;
   remote_options?: RemoteOptionsReq;
   max_file_size?: number;
 }
 
 export interface FlowActionReq {
+  id?: string;
   name: string;
   executor: "script" | "docker";
   with: Record<string, any>;
   approval?: boolean;
+  allow_node_override?: boolean;
   variables?: Record<string, any>[];
-  artifacts?: string[];
+  /** Accepted by the API but not acted on by the scheduler. */
   condition?: string;
   on?: string[];
+  needs?: string[];
 }
 
 export interface FlowCreateResp {
@@ -572,9 +625,11 @@ export interface FlowUpdateReq {
   user_schedulable?: boolean;
   max_retries?: number;
   description?: string;
+  execution_mode?: ExecutionMode;
   inputs: FlowInputReq[];
   actions: FlowActionReq[];
   outputs?: Record<string, any>[];
+  notify?: Notify[];
 }
 
 // Table component types
@@ -615,4 +670,96 @@ export interface ApiToken {
 
 export interface ApiTokenCreated extends ApiToken {
   token: string;
+}
+
+// ── Flow builder (create / edit editor state) ──
+export type BuilderSection = 'general' | 'inputs' | 'actions' | 'notify' | 'secrets';
+
+export interface BuilderAction {
+  tempId: number;
+  id: string;
+  name: string;
+  executor: string;
+  with: Record<string, any>;
+  withByExecutor: Record<string, Record<string, any>>;
+  selectedNodes: string[];
+  variables: Array<{ name: string; value: string }>;
+  approval: boolean;
+  allow_node_override: boolean;
+  needs: string[];
+}
+
+export interface BuilderInput {
+  name: string;
+  type: FlowInputReq['type'];
+  label: string;
+  description: string;
+  required: boolean;
+  default: string;
+  validation: string;
+  options: string[];
+  multiple?: boolean;
+  useRemoteOptions?: boolean;
+  remote_options?: RemoteOptionsReq;
+  maxFileSizeMB?: number;
+}
+
+export interface BuilderMetadata {
+  id: string;
+  name: string;
+  description: string;
+  prefix: string;
+  schedules: Schedule[];
+  allow_overlap: boolean;
+  user_schedulable: boolean;
+  max_retries: number;
+  execution_mode: '' | ExecutionMode;
+}
+
+export interface BuilderFlow {
+  metadata: BuilderMetadata;
+  inputs: BuilderInput[];
+  actions: BuilderAction[];
+  notifications: Notify[];
+}
+
+export interface FlowProblem {
+  severity: 'error' | 'warning';
+  message: string;
+  section: BuilderSection;
+  actionId?: string;
+}
+
+export interface FlowVersionListItem {
+  version: number;
+  checksum: string;
+  created_at: string;
+  active: boolean;
+}
+
+export interface FlowVersionsResponse {
+  versions: FlowVersionListItem[];
+  page_count: number;
+  total_count: number;
+}
+
+export interface FlowVersionSource {
+  version: number;
+  format: string;
+  source: string;
+  created_at: string;
+  active: boolean;
+}
+
+export interface FlowDiffLine {
+  op: 'equal' | 'insert' | 'delete';
+  old?: number;
+  new?: number;
+  text: string;
+}
+
+export interface FlowVersionDiff {
+  from: number;
+  to: number;
+  lines: FlowDiffLine[];
 }

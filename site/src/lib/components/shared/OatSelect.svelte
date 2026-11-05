@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { IconChevronDown } from '@tabler/icons-svelte';
+  import IconChevronDown from '@tabler/icons-svelte/icons/chevron-down';
 
   type Option = { label: string; value: string };
 
@@ -20,7 +20,7 @@
     required?: boolean;
     id?: string;
     name?: string;
-    onchange?: () => void;
+    onchange?: (value: string) => void;
   } = $props();
 
   const popoverId = id ? `oat-sel-${id}` : `oat-sel-${Math.random().toString(36).slice(2, 7)}`;
@@ -29,13 +29,14 @@
   function select(opt: Option) {
     value = opt.value;
     document.getElementById(popoverId)?.hidePopover();
-    onchange?.();
+    onchange?.(opt.value);
   }
 </script>
 
 <ot-dropdown style="display: block; margin-block-start: var(--space-1)">
   <button
     type="button"
+    {id}
     popovertarget={popoverId}
     class="outline w-100 hstack justify-between"
     {disabled}

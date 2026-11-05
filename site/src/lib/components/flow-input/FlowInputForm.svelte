@@ -5,7 +5,8 @@
   import { handleInlineError, showSuccess } from '$lib/utils/errorHandling';
   import { getTimezones } from '$lib/utils/timezone';
   import { DateTime } from 'luxon';
-  import { IconClock, IconPlayerPlay } from '@tabler/icons-svelte';
+  import IconClock from '@tabler/icons-svelte/icons/clock';
+  import IconPlayerPlay from '@tabler/icons-svelte/icons/player-play';
   import { get } from 'svelte/store';
   import { appInfo } from '$lib/stores/auth';
   import FlowInputFields from '$lib/components/shared/FlowInputFields.svelte';
@@ -38,7 +39,7 @@
     executionInput !== null && Object.prototype.hasOwnProperty.call(executionInput, name);
 
   const formatInputValue = (input: FlowInput, value: any) => {
-    if (value === null || value === undefined) return '';
+    if (value === null || value === undefined) return input.type === 'node' ? [] : '';
 
     if (input.type === 'checkbox') {
       if (typeof value === 'boolean') return value;
@@ -48,6 +49,11 @@
 
     if (input.type === 'datetime') {
       return String(value).replace(/(:\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/, '');
+    }
+
+    if (input.type === 'node') {
+      if (Array.isArray(value)) return value;
+      return typeof value === 'string' && value ? [value] : [];
     }
 
     return String(value);
@@ -68,7 +74,7 @@
     return values;
   };
 
-  let initialValues = $state<Record<string, any>>({});
+  let initialValues = $state<Record<string, any>>(buildInitialValues());
 
   $effect(() => {
     initialValues = buildInitialValues();
@@ -154,7 +160,7 @@
       </div>
     {/if}
 
-    <FlowInputFields inputs={inputs} bind:values={initialValues} {errors} useFormData={true} />
+    <FlowInputFields inputs={inputs} bind:values={initialValues} {errors} useFormData={true} {namespace} {flowId} />
 
     <!-- Schedule option -->
     <div class="schedule-section">

@@ -84,10 +84,48 @@ svg.icon-tabler {
 .shrink-0 { flex-shrink: 0; }
 .nowrap { flex-wrap: nowrap; }
 
+.req { color: var(--danger); }
+
+.overline {
+  font-size: var(--text-8);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge button {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  margin-inline-start: var(--space-1);
+}
+.badge button:hover { color: var(--danger); }
+
+/* ── Editor pane ── */
+.pane-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-6);
+}
+.pane-inner {
+  max-width: 52rem;
+  margin: 0 auto;
+}
+
 /* App shell: consistent main area styling */
 main.app-content {
   padding-block-start: 0;
   background: var(--muted);
+  display: flex;
+  flex-direction: column;
+}
+main.app-content > * {
+  flex-shrink: 0;
+}
+main.app-content > .app-footer {
+  margin-block-start: auto;
+  padding-inline: var(--space-12);
 }
 
 /* ── Dialog form layout: scrollable content with sticky footer ── */
@@ -179,6 +217,10 @@ dialog > form > footer {
 }
 
 /* ── Extra badge variants (oat only provides success/warning/danger) ── */
+.badge.primary {
+  color: var(--primary);
+  background-color: color-mix(in srgb, var(--primary) 10%, transparent);
+}
 .badge.info {
   color: var(--info);
   background-color: color-mix(in srgb, var(--info) 10%, transparent);
@@ -188,12 +230,23 @@ dialog > form > footer {
   background-color: color-mix(in srgb, var(--neutral) 10%, transparent);
 }
 
+[data-theme="dark"] .badge.primary {
+  background-color: color-mix(in srgb, var(--primary) 30%, transparent);
+}
+
 [data-theme="dark"] .badge.info {
   background-color: color-mix(in srgb, var(--info) 30%, transparent);
 }
 
 [data-theme="dark"] .badge.neutral {
   background-color: color-mix(in srgb, var(--neutral) 30%, transparent);
+}
+
+/* oat focuses the first menu item when a dropdown opens and styles :focus like
+   :hover, so it looks hovered until the pointer moves. Keep that highlight for
+   keyboard focus only. */
+ot-dropdown [role="menuitem"]:focus:not(:focus-visible):not(:hover) {
+  background-color: transparent;
 }
 
 /* ── Selector popover (shared by Node/Group/User/Multi selectors) ── */

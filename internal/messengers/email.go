@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net/smtp"
 	"strings"
 
 	"github.com/cvhariharan/flowctl/internal/config"
@@ -56,7 +57,7 @@ func NewEmailMessenger(cfg config.SMTPConfig, groupResolver GroupResolver, logge
 		Host:     cfg.Host,
 		Port:     cfg.Port,
 		MaxConns: cfg.MaxConns,
-		Auth:     &smtppool.LoginAuth{Username: cfg.Username, Password: cfg.Password},
+		Auth:     smtpAuth(cfg.Username, cfg.Password),
 		SSL:      sslType,
 	})
 	if err != nil {
@@ -153,19 +154,7 @@ func (e *EmailMessenger) buildSubject(evt FlowExecutionEvent) string {
 
 // buildBody renders the HTML email body from event data.
 func (e *EmailMessenger) buildBody(evt FlowExecutionEvent) string {
-	var statusMsg string
-	switch evt.Status {
-	case "completed":
-		statusMsg = "has completed successfully"
-	case "errored":
-		statusMsg = "has failed with an error"
-	case "cancelled":
-		statusMsg = "was cancelled"
-	case "pending_approval":
-		statusMsg = "is waiting for approval"
-	default:
-		statusMsg = "status changed to " + evt.Status
-	}
+	statusMsg := statusText(evt.Status)
 
 	data := struct {
 		FlowName  string
@@ -220,6 +209,15 @@ func (e *EmailMessenger) resolveReceivers(ctx context.Context, receivers []strin
 		}
 	}
 	return to
+}
+
+// smtpAuth returns nil when username is empty, skipping SMTP AUTH entirely.
+// This allows connecting to local MTAs that don't require authentication.
+func smtpAuth(username, password string) smtp.Auth {
+	if username == "" {
+		return nil
+	}
+	return &smtppool.LoginAuth{Username: username, Password: password}
 }
 
 // Close closes the SMTP connection pool

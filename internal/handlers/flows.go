@@ -2,7 +2,7 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cvhariharan/flowctl/internal/core"
 	"github.com/cvhariharan/flowctl/internal/core/models"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -18,6 +19,7 @@ import (
 
 const (
 	optionsRequestIDHeader = "X-Options-Request-ID"
+	importBodyOverhead     = 4 << 10
 )
 
 // populateRemoteOptions calls core.PopulateRemoteOptions and handles errors.
@@ -139,6 +141,14 @@ func (h *Handler) processFlowInputs(c echo.Context, flow models.Flow, execID str
 			} else {
 				req[input.Name] = "false"
 			}
+		case models.INPUT_TYPE_NODE:
+			form, err := c.FormParams()
+			if err != nil {
+				return nil, err
+			}
+			if values := form[input.Name]; len(values) > 0 {
+				req[input.Name] = values
+			}
 		default:
 			if value := c.FormValue(input.Name); value != "" {
 				req[input.Name] = value
@@ -218,118 +228,12 @@ func (h *Handler) HandleFlowTrigger(c echo.Context) error {
 	return c.JSON(http.StatusOK, resp)
 }
 
-func (h *Handler) HandleLogStreaming(c echo.Context) error {
-	namespace, ok := c.Get("namespace").(string)
-	if !ok {
-		return wrapError(ErrRequiredFieldMissing, "could not get namespace", nil, nil)
-	}
-
-	req := LogStreamingReq{LogID: c.Param("logID")}
-	if err := h.validate.Struct(req); err != nil {
-		return wrapError(ErrValidationFailed, fmt.Sprintf("request validation failed: %s", formatValidationErrors(err)), err, nil)
-	}
-
-	logID := req.LogID
-
-	execSummary, err := h.co.GetExecutionSummaryByExecID(c.Request().Context(), logID, namespace)
-	if err != nil {
-		return wrapError(ErrResourceNotFound, "execution not found", err, nil)
-	}
-
-	streamUser, err := h.getUserInfo(c)
-	if err != nil {
-		return wrapError(ErrForbidden, "could not get user info", err, nil)
-	}
-
-	restricted, err := h.isUserOnly(c.Request().Context(), streamUser.ID, namespace)
-	if err != nil {
-		return wrapError(ErrOperationFailed, "could not determine user role", err, nil)
-	}
-	if restricted && execSummary.TriggeredByID != streamUser.ID {
-		return wrapError(ErrForbidden, "insufficient permissions", nil, nil)
-	}
-
-	c.Response().Header().Set("Content-Type", "text/event-stream")
-	c.Response().Header().Set("Cache-Control", "no-cache")
-	c.Response().Header().Set("Connection", "keep-alive")
-	c.Response().Header().Set("X-Accel-Buffering", "no")
-	c.Response().WriteHeader(http.StatusOK)
-
-	h.logger.Debug("SSE connection created", "logID", logID)
-
-	msgCh, err := h.co.StreamLogs(c.Request().Context(), logID, namespace)
-	if err != nil {
-		h.logger.Error("log msg ch", "error", err)
+func (h *Handler) HandleLogDownload(c echo.Context) error {
+	if _, err := h.authorizeExecutionAccess(c); err != nil {
 		return err
 	}
-
-	heartbeatTicker := time.NewTicker(5 * time.Second)
-	defer heartbeatTicker.Stop()
-
-	for {
-		select {
-		case <-c.Request().Context().Done():
-			h.logger.Debug("SSE client disconnected", "logID", logID)
-			return nil
-		case <-heartbeatTicker.C:
-			if _, err := fmt.Fprintf(c.Response(), ": heartbeat\n\n"); err != nil {
-				h.logger.Error("SSE heartbeat error", "error", err, "logID", logID)
-				return nil
-			}
-			if flusher, ok := c.Response().Unwrap().(http.Flusher); ok {
-				flusher.Flush()
-			}
-		case msg, ok := <-msgCh:
-			if !ok {
-				h.logger.Debug("SSE message channel closed", "logID", logID)
-				if _, err := fmt.Fprintf(c.Response(), "event: end\ndata: {}\n\n"); err != nil {
-					h.logger.Error("SSE end event error", "error", err)
-					return err
-				}
-				if flusher, ok := c.Response().Unwrap().(http.Flusher); ok {
-					flusher.Flush()
-				}
-				h.logger.Debug("SSE streaming completed", "logID", logID)
-				return nil
-			}
-			if err := h.handleLogStreaming(msg, c.Response()); err != nil {
-				h.logger.Error("SSE streaming error", "error", err, "logID", logID)
-				return nil
-			}
-		}
-	}
-}
-
-func (h *Handler) HandleLogDownload(c echo.Context) error {
-	namespace, ok := c.Get("namespace").(string)
-	if !ok {
-		return wrapError(ErrRequiredFieldMissing, "could not get namespace", nil, nil)
-	}
-
-	req := LogStreamingReq{LogID: c.Param("logID")}
-	if err := h.validate.Struct(req); err != nil {
-		return wrapError(ErrValidationFailed, fmt.Sprintf("request validation failed: %s", formatValidationErrors(err)), err, nil)
-	}
-
-	logID := req.LogID
-
-	execSummary, err := h.co.GetExecutionSummaryByExecID(c.Request().Context(), logID, namespace)
-	if err != nil {
-		return wrapError(ErrResourceNotFound, "execution not found", err, nil)
-	}
-
-	downloadUser, err := h.getUserInfo(c)
-	if err != nil {
-		return wrapError(ErrForbidden, "could not get user info", err, nil)
-	}
-
-	restricted, err := h.isUserOnly(c.Request().Context(), downloadUser.ID, namespace)
-	if err != nil {
-		return wrapError(ErrOperationFailed, "could not determine user role", err, nil)
-	}
-	if restricted && execSummary.TriggeredByID != downloadUser.ID {
-		return wrapError(ErrForbidden, "insufficient permissions", nil, nil)
-	}
+	namespace := c.Get("namespace").(string)
+	logID := c.Param("logID")
 
 	c.Response().Header().Set("Content-Type", "application/octet-stream")
 	c.Response().Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.log"`, logID))
@@ -338,50 +242,6 @@ func (h *Handler) HandleLogDownload(c echo.Context) error {
 	if err := h.co.DownloadLogs(c.Request().Context(), logID, namespace, c.Response()); err != nil {
 		h.logger.Error("log download error", "logID", logID, "error", err)
 		return err
-	}
-
-	return nil
-}
-
-func (h *Handler) handleLogStreaming(msg models.StreamMessage, w http.ResponseWriter) error {
-	var response FlowLogResp
-
-	switch msg.MType {
-	case models.ResultMessageType:
-		var res map[string]string
-		if err := json.Unmarshal([]byte(msg.Val), &res); err != nil {
-			return fmt.Errorf("could not decode results: %w", err)
-		}
-
-		response = FlowLogResp{
-			ActionID:  msg.ActionID,
-			MType:     string(msg.MType),
-			Results:   res,
-			NodeID:    msg.NodeID,
-			Timestamp: msg.Timestamp,
-		}
-	default:
-		h.logger.Debug("Default message", "type", msg.MType, "value", msg.Val)
-		response = FlowLogResp{
-			ActionID:  msg.ActionID,
-			MType:     string(msg.MType),
-			NodeID:    msg.NodeID,
-			Value:     msg.Val,
-			Timestamp: msg.Timestamp,
-		}
-	}
-
-	jsonData, err := json.Marshal(response)
-	if err != nil {
-		return fmt.Errorf("could not marshal response: %w", err)
-	}
-
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", jsonData); err != nil {
-		return err
-	}
-
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
 	}
 
 	return nil
@@ -424,6 +284,12 @@ func (h *Handler) HandleFlowsPagination(c echo.Context) error {
 	for i, flow := range flows {
 		flowItems[i] = coreFlowToFlow(flow)
 	}
+
+	nextRuns, err := h.co.GetNextScheduledRuns(c.Request().Context(), namespace, flowSlugs(flowItems))
+	if err != nil {
+		return wrapError(ErrOperationFailed, "could not get next scheduled runs", err, nil)
+	}
+	attachNextRuns(flowItems, nextRuns)
 
 	return c.JSON(http.StatusOK, FlowsPaginateResponse{
 		Flows:      flowItems,
@@ -619,6 +485,19 @@ func (h *Handler) HandleGetFlowInputs(c echo.Context) error {
 	}
 
 	inputs := coreFlowInputsToInputs(flow.Inputs)
+	for i, input := range flow.Inputs {
+		if !input.HasDynamicDefault() {
+			continue
+		}
+		value, err := input.ResolveDefault()
+		if err != nil {
+			h.logger.Warn("could not resolve input default", "flow", req.FlowID, "input", input.Name, "error", err)
+			value = ""
+		}
+		inputs[i].Default = value
+		inputs[i].DefaultDynamic = true
+	}
+
 	return c.JSON(http.StatusOK, FlowInputsResp{
 		Inputs:           inputs,
 		OptionsRequestID: optionsRequestID,
@@ -639,6 +518,17 @@ func (h *Handler) HandleGetFlowMeta(c echo.Context) error {
 	flow, err := h.co.GetFlowByID(req.FlowID, namespace)
 	if err != nil {
 		return wrapError(ErrResourceNotFound, "flow not found", err, nil)
+	}
+
+	if value := c.QueryParam("version"); value != "" {
+		version, err := parseVersion(value)
+		if err != nil {
+			return err
+		}
+		flow, err = h.co.GetFlowVersion(c.Request().Context(), req.FlowID, namespace, version)
+		if err != nil {
+			return flowVersionError(err)
+		}
 	}
 
 	// Get scheduled executions for this flow
@@ -687,6 +577,7 @@ func (h *Handler) HandleCreateFlow(c echo.Context) error {
 	var schedules []models.Schedule
 	for _, sched := range req.Meta.Schedules {
 		schedules = append(schedules, models.Schedule{
+			Name:     sched.Name,
 			Cron:     sched.Cron,
 			Timezone: sched.Timezone,
 		})
@@ -694,13 +585,15 @@ func (h *Handler) HandleCreateFlow(c echo.Context) error {
 
 	flow := models.Flow{
 		Meta: models.Metadata{
-			ID:           GenerateSlug(req.Meta.Name),
-			Name:         req.Meta.Name,
-			Description:  req.Meta.Description,
-			Prefix:       req.Meta.Prefix,
-			Namespace:    namespace,
-			AllowOverlap: req.Meta.AllowOverlap,
-			MaxRetries:   req.Meta.MaxRetries,
+			ID:              GenerateSlug(req.Meta.Name),
+			Name:            req.Meta.Name,
+			Description:     req.Meta.Description,
+			Prefix:          req.Meta.Prefix,
+			Namespace:       namespace,
+			AllowOverlap:    req.Meta.AllowOverlap,
+			UserSchedulable: req.Meta.UserSchedulable,
+			MaxRetries:      req.Meta.MaxRetries,
+			ExecutionMode:   models.ExecutionMode(req.Meta.ExecutionMode),
 		},
 		Inputs:    convertFlowInputsReqToInputs(req.Inputs),
 		Actions:   convertFlowActionsReqToActions(req.Actions),
@@ -741,6 +634,7 @@ func (h *Handler) HandleUpdateFlow(c echo.Context) error {
 	var schedules []models.Schedule
 	for _, sched := range req.Schedules {
 		schedules = append(schedules, models.Schedule{
+			Name:     sched.Name,
 			Cron:     sched.Cron,
 			Timezone: sched.Timezone,
 		})
@@ -752,6 +646,7 @@ func (h *Handler) HandleUpdateFlow(c echo.Context) error {
 	updatedMeta.UserSchedulable = req.UserSchedulable
 	updatedMeta.MaxRetries = req.MaxRetries
 	updatedMeta.Description = req.Description
+	updatedMeta.ExecutionMode = models.ExecutionMode(req.ExecutionMode)
 
 	flow := models.Flow{
 		Meta:      updatedMeta,
@@ -802,6 +697,7 @@ func (h *Handler) HandleGetFlowConfig(c echo.Context) error {
 	schedules := make([]Schedule, 0)
 	for _, s := range f.Schedules {
 		schedules = append(schedules, Schedule{
+			Name:     s.Name,
 			Cron:     s.Cron,
 			Timezone: s.Timezone,
 		})
@@ -817,11 +713,91 @@ func (h *Handler) HandleGetFlowConfig(c echo.Context) error {
 			AllowOverlap:    f.Meta.AllowOverlap,
 			UserSchedulable: f.Meta.UserSchedulable,
 			MaxRetries:      f.Meta.MaxRetries,
+			ExecutionMode:   string(f.Meta.ExecutionMode),
 		},
 		Inputs:        convertFlowInputsToInputsReq(f.Inputs),
 		Actions:       convertFlowActionsToActionsReq(f.Actions),
 		Notifications: convertNotifyToNotifyReq(f.Notify),
 	})
+}
+
+func (h *Handler) HandleExportFlow(c echo.Context) error {
+	namespaceID, ok := c.Get("namespace").(string)
+	if !ok {
+		return wrapError(ErrRequiredFieldMissing, "could not get namespace", nil, nil)
+	}
+
+	f, err := h.co.GetFlowByID(c.Param("flowID"), namespaceID)
+	if err != nil {
+		return wrapError(ErrResourceNotFound, "flow not found", err, nil)
+	}
+
+	data, err := models.MarshalFlow(f, models.FlowFormatYAML)
+	if err != nil {
+		return wrapError(ErrOperationFailed, "could not marshal flow to YAML", err, nil)
+	}
+
+	c.Response().Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.yaml"`, f.Meta.ID))
+	return c.Blob(http.StatusOK, "application/yaml", data)
+}
+
+func (h *Handler) HandleImportFlow(c echo.Context) error {
+	namespaceID, ok := c.Get("namespace").(string)
+	if !ok {
+		return wrapError(ErrRequiredFieldMissing, "could not get namespace", nil, nil)
+	}
+
+	maxSize := h.config.App.MaxFlowImportSize
+	tooLargeMsg := fmt.Sprintf("flow file exceeds maximum size of %dKB", maxSize/1024)
+
+	c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, maxSize+importBodyOverhead)
+
+	file, err := c.FormFile("file")
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return wrapError(ErrInvalidInput, tooLargeMsg, err, nil)
+		}
+		return wrapError(ErrInvalidInput, "flow file is required", err, nil)
+	}
+
+	if file.Size > maxSize {
+		return wrapError(ErrInvalidInput, tooLargeMsg, nil, nil)
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		return wrapError(ErrInvalidInput, "could not open flow file", err, nil)
+	}
+	defer src.Close()
+
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return wrapError(ErrInvalidInput, "could not read flow file", err, nil)
+	}
+
+	flow, err := models.UnmarshalFlow(data, core.DetectFlowFormat(file.Filename))
+	if err != nil {
+		return wrapError(ErrInvalidInput, err.Error(), err, nil)
+	}
+
+	flow.Meta.Namespace = c.Param("namespace")
+	if flow.Meta.ID == "" {
+		flow.Meta.ID = GenerateSlug(flow.Meta.Name)
+	}
+
+	if err := flow.Validate(); err != nil {
+		return wrapError(ErrValidationFailed, err.Error(), err, nil)
+	}
+
+	if err := h.co.CreateFlow(c.Request().Context(), flow, namespaceID); err != nil {
+		if errors.Is(err, core.ErrFlowExists) {
+			return wrapError(ErrResourceConflict, fmt.Sprintf("a flow with id %s already exists in this namespace", flow.Meta.ID), err, nil)
+		}
+		return wrapError(ErrOperationFailed, err.Error(), err, nil)
+	}
+
+	return c.JSON(http.StatusCreated, FlowCreateResp{ID: flow.Meta.ID})
 }
 
 func (h *Handler) HandleCancelExecution(c echo.Context) error {
@@ -855,6 +831,9 @@ func (h *Handler) HandleCancelExecution(c echo.Context) error {
 
 	err = h.co.CancelFlowExecution(c.Request().Context(), execID, namespace)
 	if err != nil {
+		if errors.Is(err, core.ErrInvalidExecutionState) {
+			return wrapError(ErrResourceConflict, "execution is not cancellable", err, nil)
+		}
 		return wrapError(ErrOperationFailed, "failed to cancel execution", err, nil)
 	}
 
@@ -875,6 +854,13 @@ func (h *Handler) HandleRetryExecution(c echo.Context) error {
 		return wrapError(ErrRequiredFieldMissing, "execution ID is required", nil, nil)
 	}
 
+	var req RetryExecutionReq
+	if c.Request().ContentLength != 0 {
+		if err := c.Bind(&req); err != nil && !errors.Is(err, io.EOF) {
+			return wrapError(ErrInvalidInput, "invalid request", err, nil)
+		}
+	}
+
 	user, err := h.getUserInfo(c)
 	if err != nil {
 		return wrapError(ErrAuthenticationFailed, "could not get user details", err, nil)
@@ -893,8 +879,18 @@ func (h *Handler) HandleRetryExecution(c echo.Context) error {
 		return wrapError(ErrForbidden, "insufficient permissions", nil, nil)
 	}
 
-	err = h.co.RetryFlowExecution(c.Request().Context(), execID, user.ID, namespace)
+	if req.FromAction == "" {
+		err = h.co.RetryFlowExecution(c.Request().Context(), execID, user.ID, namespace)
+	} else {
+		err = h.co.RerunFlowExecutionFromAction(c.Request().Context(), execID, req.FromAction, user.ID, namespace)
+	}
 	if err != nil {
+		if errors.Is(err, core.ErrActionNotFound) {
+			return wrapError(ErrInvalidInput, err.Error(), err, nil)
+		}
+		if errors.Is(err, core.ErrInvalidExecutionState) {
+			return wrapError(ErrResourceConflict, "execution is not retryable", err, nil)
+		}
 		return wrapError(ErrOperationFailed, err.Error(), err, nil)
 	}
 

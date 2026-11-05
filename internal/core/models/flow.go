@@ -9,12 +9,17 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cvhariharan/flowctl/internal/expreval"
 	"github.com/cvhariharan/flowctl/internal/scheduler"
-	"github.com/expr-lang/expr"
 	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"github.com/huml-lang/go-huml"
 	"gopkg.in/yaml.v3"
+)
+
+var (
+	flowEvaluator         = expreval.New()
+	inputDefaultEvaluator = expreval.New(expreval.Strict())
 )
 
 type InputType string
@@ -27,6 +32,14 @@ const (
 	INPUT_TYPE_DATETIME InputType = "datetime"
 	INPUT_TYPE_CHECKBOX InputType = "checkbox"
 	INPUT_TYPE_SELECT   InputType = "select"
+	INPUT_TYPE_NODE     InputType = "node"
+)
+
+type ExecutionMode = scheduler.ExecutionMode
+
+const (
+	ExecutionModeSequential = scheduler.ExecutionModeSequential
+	ExecutionModeDAG        = scheduler.ExecutionModeDAG
 )
 
 type RemoteOptions struct {
@@ -37,13 +50,14 @@ type RemoteOptions struct {
 
 type Input struct {
 	Name          string         `yaml:"name" huml:"name" json:"name" validate:"required,alphanum_underscore"`
-	Type          InputType      `yaml:"type" huml:"type" json:"type" validate:"required,oneof=string number password file datetime checkbox select"`
+	Type          InputType      `yaml:"type" huml:"type" json:"type" validate:"required,oneof=string number password file datetime checkbox select node"`
 	Label         string         `yaml:"label" huml:"label" json:"label"`
 	Description   string         `yaml:"description" huml:"description" json:"description"`
 	Validation    string         `yaml:"validation" huml:"validation" json:"validation"`
 	Required      bool           `yaml:"required" huml:"required" json:"required"`
 	Default       string         `yaml:"default" huml:"default" json:"default"`
 	Options       []string       `yaml:"options" huml:"options" json:"options"`
+	Multiple      bool           `yaml:"multiple" huml:"multiple" json:"multiple"`
 	MaxFileSize   int64          `yaml:"max_file_size" huml:"max_file_size" json:"max_file_size"`
 	RemoteOptions *RemoteOptions `yaml:"remote_options,omitempty" huml:"remote_options" json:"remote_options,omitempty"`
 }
@@ -63,19 +77,22 @@ const (
 )
 
 type Notify struct {
-	Channel string         `yaml:"channel" huml:"channel" json:"channel" validate:"required,oneof=email webhook"`
+	Channel string         `yaml:"channel" huml:"channel" json:"channel" validate:"required,oneof=email webhook chat"`
 	Config  map[string]any `yaml:"config" huml:"config" json:"config" validate:"required"`
 	Events  []NotifyEvent  `yaml:"events" huml:"events" json:"events" validate:"required,dive,min=1,oneof=on_success on_failure on_waiting on_cancelled"`
 }
 
 type Action struct {
-	ID        string         `yaml:"id" huml:"id" validate:"required,alphanum_underscore"`
-	Name      string         `yaml:"name" huml:"name" validate:"required"`
-	Executor  string         `yaml:"executor" huml:"executor"`
-	With      map[string]any `yaml:"with" huml:"with" validate:"required"`
-	Approval  bool           `yaml:"approval" huml:"approval"`
-	Variables []Variable     `yaml:"variables" huml:"variables"`
-	On        []string       `yaml:"on" huml:"on"`
+	ID                string         `yaml:"id" huml:"id" validate:"required,alphanum_underscore"`
+	Name              string         `yaml:"name" huml:"name" validate:"required"`
+	Executor          string         `yaml:"executor" huml:"executor"`
+	With              map[string]any `yaml:"with" huml:"with" validate:"required"`
+	Approval          bool           `yaml:"approval" huml:"approval"`
+	AllowNodeOverride bool           `yaml:"allow_node_override" huml:"allow_node_override" json:"allow_node_override"`
+	Variables         []Variable     `yaml:"variables" huml:"variables"`
+	On                []string       `yaml:"on" huml:"on"`
+	// Needs lists action IDs this action depends on. Only used when the flow's execution mode is dag.
+	Needs []string `yaml:"needs,omitempty" huml:"needs" json:"needs,omitempty"`
 }
 
 func SchedulerActionToAction(a scheduler.Action) Action {
@@ -90,27 +107,36 @@ func SchedulerActionToAction(a scheduler.Action) Action {
 	}
 
 	return Action{
-		ID:        a.ID,
-		Name:      a.Name,
-		With:      a.With,
-		On:        nodeNames,
-		Executor:  a.Executor,
-		Approval:  a.Approval,
-		Variables: variables,
+		ID:                a.ID,
+		Name:              a.Name,
+		With:              a.With,
+		On:                nodeNames,
+		Executor:          a.Executor,
+		Approval:          a.Approval,
+		AllowNodeOverride: a.AllowNodeOverride,
+		Variables:         variables,
+		Needs:             a.Needs,
 	}
 }
 
 type Metadata struct {
-	ID              string `yaml:"id" huml:"id" validate:"required,alphanum_underscore"`
-	DBID            int32  `yaml:"-" huml:"-"`
-	Name            string `yaml:"name" huml:"name" validate:"required,alphanum_whitespace,min=1,max=150"`
-	Description     string `yaml:"description" huml:"description" validate:"max=255,no_html"`
-	SrcDir          string `yaml:"-" huml:"-"`
-	Namespace       string `yaml:"namespace" huml:"namespace"`
-	Prefix          string `yaml:"prefix" huml:"prefix" validate:"omitempty,alphanum_underscore,max=100"`
-	AllowOverlap    bool   `yaml:"allow_overlap" huml:"allow_overlap"`
-	UserSchedulable bool   `yaml:"user_schedulable" huml:"user_schedulable"`
-	MaxRetries      int    `yaml:"max_retries" huml:"max_retries" validate:"omitempty,min=0,max=10"`
+	ID              string        `yaml:"id" huml:"id" validate:"required,alphanum_underscore"`
+	DBID            int32         `yaml:"-" huml:"-"`
+	VersionDBID     int32         `yaml:"-" huml:"-"`
+	Version         int           `yaml:"-" huml:"-"`
+	Name            string        `yaml:"name" huml:"name" validate:"required,alphanum_whitespace,min=1,max=150"`
+	Description     string        `yaml:"description" huml:"description" validate:"max=255,no_html"`
+	SrcDir          string        `yaml:"-" huml:"-"`
+	Namespace       string        `yaml:"namespace" huml:"namespace"`
+	Prefix          string        `yaml:"prefix" huml:"prefix" validate:"omitempty,alphanum_underscore,max=100"`
+	AllowOverlap    bool          `yaml:"allow_overlap" huml:"allow_overlap"`
+	UserSchedulable bool          `yaml:"user_schedulable" huml:"user_schedulable"`
+	MaxRetries      int           `yaml:"max_retries" huml:"max_retries" validate:"omitempty,min=0,max=10"`
+	ExecutionMode   ExecutionMode `yaml:"execution_mode,omitempty" huml:"execution_mode" validate:"omitempty,oneof=sequential dag"`
+}
+
+func (m Metadata) IsDAG() bool {
+	return m.ExecutionMode == ExecutionModeDAG
 }
 
 type Variable map[string]any
@@ -232,6 +258,20 @@ func (f Flow) Validate() error {
 		actionsIDs[action.ID] = 1
 	}
 
+	if err := f.validateDependencies(); err != nil {
+		return err
+	}
+
+	nodeInputCount := 0
+	for _, input := range f.Inputs {
+		if input.Type == INPUT_TYPE_NODE {
+			nodeInputCount++
+		}
+	}
+	if nodeInputCount > 1 {
+		return fmt.Errorf("only one input of type node is allowed per flow")
+	}
+
 	// Validate default values for inputs
 	for _, input := range f.Inputs {
 		if err := validateDefaultValue(input); err != nil {
@@ -258,6 +298,31 @@ func (f Flow) Validate() error {
 	}
 
 	return validate.Struct(f)
+}
+
+// validateDependencies rejects "needs" outside dag mode and builds the graph to surface missing
+// references, self-references and cycles.
+func (f Flow) validateDependencies() error {
+	if !f.Meta.IsDAG() {
+		for _, action := range f.Actions {
+			if len(action.Needs) > 0 {
+				return fmt.Errorf("action %s declares needs, which requires metadata.execution_mode to be %q", action.ID, ExecutionModeDAG)
+			}
+		}
+		return nil
+	}
+
+	_, err := f.Graph()
+	return err
+}
+
+// Graph builds the action dependency graph for the flow.
+func (f Flow) Graph() (*scheduler.Graph, error) {
+	actions := make([]scheduler.Action, 0, len(f.Actions))
+	for _, a := range f.Actions {
+		actions = append(actions, scheduler.Action{ID: a.ID, Needs: a.Needs})
+	}
+	return scheduler.BuildGraph(actions)
 }
 
 func (f Flow) GetActionIndexByID(id string) (int, error) {
@@ -289,21 +354,56 @@ func validateDefaultValue(input Input) error {
 		return nil
 	}
 
+	if input.HasDynamicDefault() {
+		if err := inputDefaultEvaluator.ValidateTemplate(input.Default, nil); err != nil {
+			return fmt.Errorf("invalid default expression: %w", err)
+		}
+		return nil
+	}
+
+	if strings.Contains(input.Default, "{{") {
+		return fmt.Errorf("invalid default expression: %q is not a closed {{ ... }} expression", input.Default)
+	}
+
+	return validateDefaultLiteral(input, input.Default)
+}
+
+func validateDefaultLiteral(input Input, value string) error {
 	switch input.Type {
 	case INPUT_TYPE_CHECKBOX:
-		if input.Default != "true" && input.Default != "false" {
+		if value != "true" && value != "false" {
 			return fmt.Errorf("default for checkbox must be 'true' or 'false'")
 		}
 	case INPUT_TYPE_NUMBER:
-		if _, err := strconv.ParseFloat(input.Default, 64); err != nil {
+		if _, err := strconv.ParseFloat(value, 64); err != nil {
 			return fmt.Errorf("default for number must be a valid number")
 		}
 	case INPUT_TYPE_SELECT:
-		if len(input.Options) > 0 && !slices.Contains(input.Options, input.Default) {
+		if len(input.Options) > 0 && !slices.Contains(input.Options, value) {
 			return fmt.Errorf("default for select must be one of the options")
 		}
 	}
 	return nil
+}
+
+func (i Input) HasDynamicDefault() bool {
+	return i.Default != "" && inputDefaultEvaluator.HasTemplate(i.Default)
+}
+
+func (i Input) ResolveDefault() (string, error) {
+	if !i.HasDynamicDefault() {
+		return i.Default, nil
+	}
+
+	value, err := inputDefaultEvaluator.Interpolate(i.Default, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if err := validateDefaultLiteral(i, value); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func (f Flow) ValidateInput(inputs map[string]interface{}) *FlowValidationError {
@@ -335,12 +435,7 @@ func (f Flow) ValidateInput(inputs map[string]interface{}) *FlowValidationError 
 			input.Name: value,
 		}
 
-		program, err := expr.Compile(input.Validation, expr.Env(env))
-		if err != nil {
-			return &FlowValidationError{FieldName: input.Name, Msg: "Failed running validation", Err: err}
-		}
-
-		output, err := expr.Run(program, env)
+		output, err := flowEvaluator.Eval(input.Validation, env)
 		if err != nil {
 			return &FlowValidationError{FieldName: input.Name, Msg: "Failed running validation", Err: err}
 		}
@@ -377,6 +472,19 @@ func validateType(name string, val interface{}, t InputType) error {
 		if !ok {
 			return fmt.Errorf("input %s must be a boolean", name)
 		}
+	case INPUT_TYPE_NODE:
+		if _, ok := val.([]string); ok {
+			return nil
+		}
+		if items, ok := val.([]interface{}); ok {
+			for _, it := range items {
+				if _, ok := it.(string); !ok {
+					return fmt.Errorf("input %s must be a list of strings", name)
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("input %s must be a list of strings", name)
 	default:
 		return fmt.Errorf("unknown input type: %s", t)
 	}
@@ -385,11 +493,9 @@ func validateType(name string, val interface{}, t InputType) error {
 }
 
 type Execution struct {
-	Input       map[string]interface{} `json:"input"`
-	ExecID      string                 `json:"exec_id"`
-	Version     int64                  `json:"version"`
-	ErrorMsg    string                 `json:"error_msg"`
-	TriggeredBy string                 `json:"triggered_by"`
+	Context  ExecutionContext `json:"context"`
+	ExecID   string           `json:"exec_id"`
+	ErrorMsg string           `json:"error_msg"`
 }
 
 // FlowFormat represents the file format for flows
@@ -456,11 +562,81 @@ func ParseActionTargets(on []string) (nodeNames []string, tags []string) {
 	return nodeNames, tags
 }
 
+// ResolveTargets resolves a list of node names / "tag:<name>" entries into deduplicated Nodes.
+func ResolveTargets(
+	ctx context.Context,
+	targets []string,
+	namespaceUUID uuid.UUID,
+	getNodesByNames func(context.Context, []string, uuid.UUID) ([]Node, error),
+	getNodesByTags func(context.Context, []string, uuid.UUID) ([]Node, error),
+) ([]Node, error) {
+	nodeNames, tags := ParseActionTargets(targets)
+
+	var nodes []Node
+	if len(nodeNames) > 0 {
+		byName, err := getNodesByNames(ctx, nodeNames, namespaceUUID)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, byName...)
+	}
+
+	if len(tags) > 0 {
+		byTag, err := getNodesByTags(ctx, tags, namespaceUUID)
+		if err != nil {
+			return nil, err
+		}
+		seen := make(map[string]bool, len(nodes))
+		for _, n := range nodes {
+			seen[n.ID] = true
+		}
+		for _, n := range byTag {
+			if !seen[n.ID] {
+				nodes = append(nodes, n)
+				seen[n.ID] = true
+			}
+		}
+	}
+
+	return nodes, nil
+}
+
+// NodesToScheduler converts a slice of models.Node to []scheduler.Node.
+func NodesToScheduler(nodes []Node) []scheduler.Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+	out := make([]scheduler.Node, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, scheduler.Node{
+			ID:             node.ID,
+			Name:           node.Name,
+			Hostname:       node.Hostname,
+			Port:           node.Port,
+			Username:       node.Username,
+			OSFamily:       node.OSFamily,
+			ConnectionType: node.ConnectionType,
+			Tags:           node.Tags,
+			Auth: scheduler.NodeAuth{
+				CredentialID: node.Auth.CredentialID,
+				Method:       scheduler.AuthMethod(node.Auth.Method),
+				Key:          node.Auth.Key,
+			},
+		})
+	}
+	return out
+}
+
 // ConvertToSchedulerFlow converts a Flow to scheduler.Flow
 func ConvertToSchedulerFlow(ctx context.Context, f Flow, namespaceUUID uuid.UUID, getNodesByNames func(context.Context, []string, uuid.UUID) ([]Node, error), getNodesByTags func(context.Context, []string, uuid.UUID) ([]Node, error)) (scheduler.Flow, error) {
 	// Convert inputs
 	var inputs []scheduler.Input
 	for _, inp := range f.Inputs {
+		defaultValue, err := inp.ResolveDefault()
+		if err != nil {
+			return scheduler.Flow{}, fmt.Errorf("failed to resolve default for input %s: %w", inp.Name, err)
+		}
+
 		inputs = append(inputs, scheduler.Input{
 			Name:        inp.Name,
 			Type:        scheduler.InputType(inp.Type),
@@ -468,76 +644,33 @@ func ConvertToSchedulerFlow(ctx context.Context, f Flow, namespaceUUID uuid.UUID
 			Description: inp.Description,
 			Validation:  inp.Validation,
 			Required:    inp.Required,
-			Default:     inp.Default,
+			Default:     defaultValue,
 			MaxFileSize: inp.MaxFileSize,
 		})
 	}
 
 	var actions []scheduler.Action
 	for _, act := range f.Actions {
-		nodeNames, tags := ParseActionTargets(act.On)
-
-		var nodes []Node
-		if len(nodeNames) > 0 {
-			nodesByName, err := getNodesByNames(ctx, nodeNames, namespaceUUID)
-			if err != nil {
-				return scheduler.Flow{}, fmt.Errorf("failed to get nodes by names for action %s: %w", act.ID, err)
-			}
-			nodes = append(nodes, nodesByName...)
+		nodes, err := ResolveTargets(ctx, act.On, namespaceUUID, getNodesByNames, getNodesByTags)
+		if err != nil {
+			return scheduler.Flow{}, fmt.Errorf("failed to resolve nodes for action %s: %w", act.ID, err)
 		}
 
-		if len(tags) > 0 {
-			nodesByTags, err := getNodesByTags(ctx, tags, namespaceUUID)
-			if err != nil {
-				return scheduler.Flow{}, fmt.Errorf("failed to get nodes by tag for action %s: %w", act.ID, err)
-			}
-			// Deduplicate nodes
-			seen := make(map[string]bool)
-			for _, n := range nodes {
-				seen[n.ID] = true
-			}
-			for _, n := range nodesByTags {
-				if !seen[n.ID] {
-					nodes = append(nodes, n)
-					seen[n.ID] = true
-				}
-			}
-		}
-
-		// Convert nodes to scheduler format
-		var schedulerNodes []scheduler.Node
-		for _, node := range nodes {
-			schedulerNodes = append(schedulerNodes, scheduler.Node{
-				ID:             node.ID,
-				Name:           node.Name,
-				Hostname:       node.Hostname,
-				Port:           node.Port,
-				Username:       node.Username,
-				OSFamily:       node.OSFamily,
-				ConnectionType: node.ConnectionType,
-				Tags:           node.Tags,
-				Auth: scheduler.NodeAuth{
-					CredentialID: node.Auth.CredentialID,
-					Method:       scheduler.AuthMethod(node.Auth.Method),
-					Key:          node.Auth.Key,
-				},
-			})
-		}
-
-		// Convert variables
 		var variables []scheduler.Variable
 		for _, v := range act.Variables {
 			variables = append(variables, scheduler.Variable(v))
 		}
 
 		actions = append(actions, scheduler.Action{
-			ID:        act.ID,
-			Name:      act.Name,
-			Executor:  act.Executor,
-			With:      act.With,
-			Approval:  act.Approval,
-			Variables: variables,
-			On:        schedulerNodes,
+			ID:                act.ID,
+			Name:              act.Name,
+			Executor:          act.Executor,
+			With:              act.With,
+			Approval:          act.Approval,
+			AllowNodeOverride: act.AllowNodeOverride,
+			Variables:         variables,
+			On:                NodesToScheduler(nodes),
+			Needs:             act.Needs,
 		})
 	}
 
@@ -551,6 +684,7 @@ func ConvertToSchedulerFlow(ctx context.Context, f Flow, namespaceUUID uuid.UUID
 	var schedules []scheduler.Scheduling
 	for _, sched := range f.Schedules {
 		schedules = append(schedules, scheduler.Scheduling{
+			Name:     sched.Name,
 			Cron:     sched.Cron,
 			Timezone: sched.Timezone,
 		})
@@ -572,13 +706,15 @@ func ConvertToSchedulerFlow(ctx context.Context, f Flow, namespaceUUID uuid.UUID
 
 	return scheduler.Flow{
 		Meta: scheduler.Metadata{
-			ID:          f.Meta.ID,
-			DBID:        f.Meta.DBID,
-			Name:        f.Meta.Name,
-			Description: f.Meta.Description,
-			SrcDir:      f.Meta.SrcDir,
-			Namespace:   f.Meta.Namespace,
-			MaxRetries:  f.Meta.MaxRetries,
+			ID:            f.Meta.ID,
+			DBID:          f.Meta.DBID,
+			VersionDBID:   f.Meta.VersionDBID,
+			Name:          f.Meta.Name,
+			Description:   f.Meta.Description,
+			SrcDir:        f.Meta.SrcDir,
+			Namespace:     f.Meta.Namespace,
+			MaxRetries:    f.Meta.MaxRetries,
+			ExecutionMode: f.Meta.ExecutionMode,
 		},
 		Inputs:    inputs,
 		Actions:   actions,

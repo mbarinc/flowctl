@@ -24,6 +24,9 @@ root_url = "http://localhost:7000"
 # (required) Maximum file upload size in bytes (default: 104857600 = 100MB)
 max_file_upload_size = 104857600
 
+# (optional) Maximum size of a flow definition uploaded via flow import, in bytes
+max_flow_import_size = 262144
+
 # (optional) Directory to load external executor plugins from
 # plugin_dir = ""
 
@@ -66,6 +69,10 @@ issuer = ""
 redirect_url = ""
 # (optional) Token URL of the OIDC provider
 token_url = ""
+# (optional) Also log out of the SSO provider when logging out of flowctl (default: false)
+logout_enabled = false
+# (optional) Override the provider's discovered logout URL; requires logout_enabled = true
+logout_url = ""
 # (optional) Sign in label
 label = ""
 # (optional) Auto create users
@@ -102,8 +109,15 @@ cron_sync_interval = "5m0s"
 workers = 20
 # (required) Timeout for flow execution. A running flow will be terminated after this duration. Default - 1 hour
 flow_execution_timeout = "1h"
+# (optional) Maximum number of actions a flow in dag execution mode runs concurrently.
+# Applies to every flow on this instance. 0 or unset defaults to the number of CPU cores
+max_parallel = 0
 # (required) Default IANA timezone used as the UI pre-fill whenever a schedule timezone isn't set
 default_timezone = "UTC"
+# Terminal executions older than this are removed with their event history and approvals.
+# Configure logger.retention_time separately to remove their log files.
+execution_retention_time = "0s"
+execution_retention_interval = "1h"
 
 [db]
 # (required) Database name
@@ -135,6 +149,14 @@ dsn = ""
 enabled = true
 path = "/metrics"
 
+# Model Context Protocol endpoint at <root_url>/mcp for AI agents.
+# Agents authenticate with a personal access token and act with that user's permissions.
+[mcp]
+enabled = false
+# (optional) Maximum size of an MCP request body in bytes. It must fit the largest
+# flow definition an agent sends to create_flow or update_flow (default: 1048576 = 1MB)
+max_body_size = 1048576
+
 # Email notifications via SMTP
 # Required for flow notifications to work
 [messengers.email]
@@ -165,5 +187,13 @@ enabled = false
 # (required) Ed25519 signing key
 # Generate one with: openssl genpkey -algorithm ed25519 -outform DER | tail -c 32 | base64
 signing_key = ""
+# (optional) HTTP request timeout (default: 30s)
+timeout = "30s"
+
+# Chat notifications for Slack and Mattermost
+# The incoming webhook URL is configured per flow in its notify block
+[messengers.chat]
+# (required) Enable or disable chat notifications
+enabled = false
 # (optional) HTTP request timeout (default: 30s)
 timeout = "30s"

@@ -18,6 +18,7 @@ import (
 	"github.com/cvhariharan/flowctl/internal/core"
 	"github.com/cvhariharan/flowctl/internal/core/models"
 	"github.com/cvhariharan/flowctl/internal/handlers"
+	"github.com/cvhariharan/flowctl/internal/mcpserver"
 	"github.com/cvhariharan/flowctl/internal/messengers"
 	"github.com/cvhariharan/flowctl/internal/metrics"
 	"github.com/cvhariharan/flowctl/internal/repo"
@@ -121,6 +122,17 @@ func initMessengers(cfg config.MessengersConfig, groupResolver messengers.GroupR
 		}
 	}
 
+	if cfg.Chat.Enabled {
+		chatMessenger, err := messengers.NewChatMessenger(cfg.Chat, logger.WithGroup("chat_messenger"), appConfig.App.RootURL)
+		if err != nil {
+			logger.Error("failed to create chat messenger", "error", err)
+		} else {
+			m["chat"] = chatMessenger
+			messengers.RegisterSchema("chat", messengers.GetChatNotifySchema())
+			logger.Info("chat messenger initialized")
+		}
+	}
+
 	return m
 }
 
@@ -199,6 +211,7 @@ func initializeSharedComponents() *SharedComponents {
 		WithWorkerCount(appConfig.Scheduler.WorkerCount).
 		WithCronSyncInterval(appConfig.Scheduler.CronSyncInterval).
 		WithRetryOptions(scheduler.DefaultRetryOptions()).
+		WithExecutionRetention(appConfig.Scheduler.ExecutionRetentionTime, appConfig.Scheduler.ExecutionRetentionInterval, s.DeleteExpiredExecutionsTx).
 		Build()
 	if err != nil {
 		log.Fatal(err)
@@ -227,6 +240,7 @@ func initializeSharedComponents() *SharedComponents {
 		Logger:               logger.WithGroup("flow_handler"),
 		Metrics:              metricsManager,
 		FlowExecutionTimeout: appConfig.Scheduler.FlowExecutionTimeout,
+		MaxParallel:          appConfig.Scheduler.MaxParallel,
 		ExecutorKeys:         executorKeys,
 		APIBaseURL:           appConfig.App.RootURL,
 	})
@@ -286,6 +300,7 @@ func startServer(db *sqlx.DB, co *core.Core, metricsManager *metrics.Manager, lo
 
 	e := echo.New()
 	e.Use(middleware.Recover())
+	e.Use(h.RestrictBodyMediaType)
 	e.Use(middleware.CSRFWithConfig(middleware.CSRFConfig{
 		TokenLookup:    "header:X-CSRF-Token",
 		CookieName:     "_csrf",
@@ -365,6 +380,7 @@ func startServer(db *sqlx.DB, co *core.Core, metricsManager *metrics.Manager, lo
 	namespaceGroup := api.Group("/:namespace", h.NamespaceMiddleware)
 	namespaceGroup.GET("/flows", h.HandleFlowsPagination, h.AuthorizeNamespaceAction(models.ResourceNamespace, models.RBACActionView))
 	namespaceGroup.POST("/flows", h.HandleCreateFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionCreate))
+	namespaceGroup.POST("/flows/import", h.HandleImportFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionCreate))
 
 	namespaceGroup.GET("/flows/groups/me", h.HandleListMyFlowGroups, h.AuthorizeNamespaceAction(models.ResourceNamespace, models.RBACActionView))
 	namespaceGroup.GET("/flows/groups/:group", h.HandleGetFlowGroup, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionView))
@@ -376,16 +392,22 @@ func startServer(db *sqlx.DB, co *core.Core, metricsManager *metrics.Manager, lo
 	namespaceGroup.GET("/flows/:flowID", h.HandleGetFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionView))
 	namespaceGroup.PUT("/flows/:flowID", h.HandleUpdateFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionUpdate))
 	namespaceGroup.DELETE("/flows/:flowID", h.HandleDeleteFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionDelete))
+	namespaceGroup.GET("/flows/:flowID/export", h.HandleExportFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionExport))
 
 	namespaceGroup.GET("/flows/executions/:execID", h.HandleGetExecutionSummary, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionView))
 	namespaceGroup.POST("/flows/executions/:execID/cancel", h.HandleCancelExecution, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionUpdate))
-	namespaceGroup.POST("/flows/executions/:execID/retry", h.HandleRetryExecution, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionUpdate))
+	namespaceGroup.POST("/flows/executions/:execID/retry", h.HandleRetryExecution, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionUpdate), h.AuthorizeExecutionFlowExecute())
 	namespaceGroup.GET("/flows/:flowID/executions", h.HandleExecutionsPagination, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionView))
 	namespaceGroup.GET("/flows/executions", h.HandleAllExecutionsPagination, h.AuthorizeNamespaceAction(models.ResourceNamespace, models.RBACActionView))
 
 	namespaceGroup.GET("/flows/:flowID/inputs", h.HandleGetFlowInputs, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionView))
+	namespaceGroup.GET("/flows/:flowID/nodes", h.HandleListNodesForFlow, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionExecute))
 	namespaceGroup.GET("/flows/:flowID/meta", h.HandleGetFlowMeta, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionView))
 	namespaceGroup.GET("/flows/:flowID/config", h.HandleGetFlowConfig, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionViewConfig))
+	namespaceGroup.GET("/flows/:flowID/versions", h.HandleListFlowVersions, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionViewConfig))
+	namespaceGroup.GET("/flows/:flowID/versions/diff", h.HandleDiffFlowVersions, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionViewConfig))
+	namespaceGroup.GET("/flows/:flowID/versions/:version", h.HandleGetFlowVersion, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionViewConfig))
+	namespaceGroup.POST("/flows/:flowID/versions/:version/activate", h.HandleActivateFlowVersion, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionUpdate))
 
 	namespaceGroup.GET("/flows/:flowID/secrets", h.HandleListFlowSecrets, h.AuthorizeNamespaceAction(models.ResourceFlowSecret, models.RBACActionView))
 	namespaceGroup.GET("/flows/:flowID/secrets/:secretID", h.HandleGetFlowSecret, h.AuthorizeNamespaceAction(models.ResourceFlowSecret, models.RBACActionView))
@@ -400,7 +422,7 @@ func startServer(db *sqlx.DB, co *core.Core, metricsManager *metrics.Manager, lo
 	namespaceGroup.DELETE("/flows/:flowID/schedules/:schedule_id", h.HandleDeleteSchedule, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionExecute))
 
 	namespaceGroup.POST("/trigger/:flow", h.HandleFlowTrigger, h.AuthorizeNamespaceAction(models.ResourceFlow, models.RBACActionExecute))
-	namespaceGroup.GET("/logs/:logID", h.HandleLogStreaming, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionView))
+	namespaceGroup.GET("/logs/:logID/stream", h.HandleLogStream, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionView))
 	namespaceGroup.GET("/logs/:logID/download", h.HandleLogDownload, h.AuthorizeNamespaceAction(models.ResourceExecution, models.RBACActionView))
 
 	namespaceGroup.GET("/nodes", h.HandleListNodes, h.AuthorizeNamespaceAction(models.ResourceNode, models.RBACActionView))
@@ -435,9 +457,23 @@ func startServer(db *sqlx.DB, co *core.Core, metricsManager *metrics.Manager, lo
 	namespaceGroup.PUT("/secrets/:secretID", h.HandleUpdateNamespaceSecret, h.AuthorizeNamespaceAction(models.ResourceNamespaceSecret, models.RBACActionUpdate))
 	namespaceGroup.DELETE("/secrets/:secretID", h.HandleDeleteNamespaceSecret, h.AuthorizeNamespaceAction(models.ResourceNamespaceSecret, models.RBACActionDelete))
 
+	if appConfig.MCP.Enabled {
+		e.Any("/mcp", mcpserver.NewHandler(e, mcpserver.Options{
+			RootURL:     appConfig.App.RootURL,
+			Version:     version,
+			Logger:      logger.WithGroup("mcp"),
+			MaxBodySize: appConfig.MCP.MaxBodySize,
+		}), h.Authenticate, h.RequirePATAuth)
+	}
+
 	buildFS, err := fs.Sub(StaticFiles, "site/build")
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Serve custom branding assets from local directory
+	if appConfig.App.Branding.BrandingDir != "" {
+		e.GET("/branding/:file", h.HandleGetBrandingAsset)
 	}
 
 	// Serve static assets from embedded FS

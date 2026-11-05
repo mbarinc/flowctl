@@ -4,7 +4,10 @@
   import ScheduleModal from './ScheduleModal.svelte';
   import ViewScheduleModal from './ViewScheduleModal.svelte';
   import DeleteModal from '$lib/components/shared/DeleteModal.svelte';
-  import { IconClock, IconPlus, IconDotsVertical } from '@tabler/icons-svelte';
+  import Pagination from '$lib/components/shared/Pagination.svelte';
+  import IconClock from '@tabler/icons-svelte/icons/clock';
+  import IconPlus from '@tabler/icons-svelte/icons/plus';
+  import IconDotsVertical from '@tabler/icons-svelte/icons/dots-vertical';
   import type { UserSchedule, FlowInput, ScheduleCreateReq, ScheduleUpdateReq } from '$lib/types';
 
   let {
@@ -14,8 +17,13 @@
     userSchedulable = false,
     user,
     schedules = [],
+    totalCount,
     onUpdate,
-    canUpdateFlow = false
+    canUpdateFlow = false,
+    currentPage = 1,
+    totalPages = 1,
+    loading = false,
+    onPageChange
   }: {
     namespace: string;
     flowId: string;
@@ -23,8 +31,13 @@
     userSchedulable: boolean;
     user: any;
     schedules?: UserSchedule[];
+    totalCount?: number;
     onUpdate?: () => Promise<void>;
     canUpdateFlow?: boolean;
+    currentPage?: number;
+    totalPages?: number;
+    loading?: boolean;
+    onPageChange?: (page: number) => void;
   } = $props();
 
   let showModal = $state(false);
@@ -36,7 +49,7 @@
   let canCreateSchedule = $derived(userSchedulable);
 
   function canEdit(schedule: UserSchedule): boolean {
-    return canUpdateFlow || (schedule.is_user_created && schedule.created_by === user.id);
+    return schedule.is_user_created && (canUpdateFlow || schedule.created_by === user.id);
   }
 
   async function handleSave(data: ScheduleCreateReq | ScheduleUpdateReq) {
@@ -60,6 +73,7 @@
   async function toggleActive(schedule: UserSchedule) {
     try {
       await apiClient.flows.schedules.update(namespace, flowId, schedule.uuid, {
+        name: schedule.name,
         cron: schedule.cron,
         timezone: schedule.timezone,
         inputs: schedule.inputs,
@@ -99,7 +113,7 @@
   <header class="hstack justify-between">
     <div>
       <h3>Schedules</h3>
-      <p class="text-lighter text-xs">{schedules.length} {schedules.length === 1 ? 'schedule' : 'schedules'}</p>
+      <p class="text-lighter text-xs">{totalCount ?? schedules.length} {(totalCount ?? schedules.length) === 1 ? 'schedule' : 'schedules'}</p>
     </div>
     {#if canCreateSchedule}
       <button
@@ -131,6 +145,7 @@
       <table>
         <thead>
           <tr>
+            <th>Name</th>
             <th>Cron</th>
             <th>Timezone</th>
             <th>Type</th>
@@ -141,6 +156,11 @@
         <tbody>
           {#each schedules as schedule}
             <tr>
+              <td class="name-col">
+                <span class="schedule-name" title={schedule.name || undefined}>
+                  {schedule.name || '-'}
+                </span>
+              </td>
               <td>
                 <code>{schedule.cron}</code>
               </td>
@@ -152,7 +172,7 @@
               </td>
               <td>
                 {#if schedule.is_user_created}
-                  <span class="badge {schedule.is_active ? 'success' : ''}">
+                  <span class="badge {schedule.is_active ? 'success' : 'primary'}">
                     {schedule.is_active ? 'Active' : 'Inactive'}
                   </span>
                 {:else}
@@ -180,8 +200,6 @@
                       </div>
                     </ot-dropdown>
                   </div>
-                {:else}
-                  <span class="text-lighter">-</span>
                 {/if}
               </td>
             </tr>
@@ -189,6 +207,19 @@
         </tbody>
       </table>
     </div>
+    {#if totalPages > 1}
+      <footer class="hstack justify-between items-center">
+        <div class="text-light text-sm">
+          Showing {(currentPage - 1) * 10 + 1} to {(currentPage - 1) * 10 + schedules.length} of {totalCount} schedules
+        </div>
+        <Pagination
+          {currentPage}
+          {totalPages}
+          {loading}
+          on:page-change={(e) => onPageChange?.(e.detail.page)}
+        />
+      </footer>
+    {/if}
   {/if}
 </article>
 
@@ -207,7 +238,7 @@
 {#if showDelete && deleteSchedule}
   <DeleteModal
     title="Delete Schedule"
-    itemName={`${deleteSchedule.cron} (${deleteSchedule.timezone})`}
+    itemName={deleteSchedule.name || `${deleteSchedule.cron} (${deleteSchedule.timezone})`}
     onConfirm={handleDelete}
     onClose={() => { showDelete = false; deleteSchedule = null; }}
   />
@@ -229,6 +260,15 @@
   .actions-col {
     text-align: right;
     width: 5rem;
+  }
+  .name-col {
+    max-width: 14rem;
+  }
+  .schedule-name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .actions-wrapper {
     display: inline-flex;

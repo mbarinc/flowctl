@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cvhariharan/flowctl/internal/core/execstate"
 	"github.com/cvhariharan/flowctl/internal/core/models"
 	"github.com/gosimple/slug"
 )
@@ -133,12 +134,12 @@ type GroupsPaginateResponse struct {
 }
 
 type ApprovalActionReq struct {
-	ApprovalID string `param:"approvalID" validate:"required,uuid4"`
+	ApprovalID string `param:"approvalID" json:"-" validate:"required,uuid4"`
 	Action     string `json:"action" validate:"required,oneof=approve reject"`
 }
 
 type ApprovalGetReq struct {
-	ApprovalID string `param:"approvalID" validate:"required,uuid4"`
+	ApprovalID string `param:"approvalID" json:"-" validate:"required,uuid4"`
 }
 
 type ApprovalActionResp struct {
@@ -173,6 +174,7 @@ type ApprovalDetailsResp struct {
 	Inputs      json.RawMessage `json:"inputs,omitempty"`
 	FlowName    string          `json:"flow_name"`
 	FlowID      string          `json:"flow_id"`
+	FlowVersion int             `json:"flow_version,omitempty"`
 	DecidedBy   string          `json:"approved_by"`
 	RequestedBy string          `json:"requested_by"`
 	CreatedAt   string          `json:"created_at"`
@@ -259,7 +261,7 @@ type CredentialReq struct {
 }
 
 type CredentialGetReq struct {
-	CredID string `param:"credID" validate:"required,uuid4"`
+	CredID string `param:"credID" json:"-" validate:"required,uuid4"`
 }
 
 type CredentialUpdateReq struct {
@@ -330,13 +332,14 @@ func coreNamespaceArrayToNamespaceRespArray(namespaces []models.Namespace) []Nam
 
 // Schedule represents a cron schedule with timezone
 type Schedule struct {
+	Name     string `json:"name" validate:"max=150"`
 	Cron     string `json:"cron"`
 	Timezone string `json:"timezone"`
 }
 
 // Notify represents notification configuration for flow events
 type Notify struct {
-	Channel string         `json:"channel" validate:"required,oneof=email webhook"`
+	Channel string         `json:"channel" validate:"required,oneof=email webhook chat"`
 	Config  map[string]any `json:"config" validate:"required"`
 	Events  []string       `json:"events" validate:"required,dive,min=1,oneof=on_success on_failure on_waiting on_cancelled"`
 }
@@ -382,17 +385,20 @@ type FlowListItem struct {
 	Prefix      string     `json:"prefix"`
 	Schedules   []Schedule `json:"schedules"`
 	StepCount   int        `json:"step_count"`
+	NextRun     *time.Time `json:"next_run,omitempty"`
+	NextRunName string     `json:"next_run_name,omitempty"`
 }
 
 type FlowInput struct {
-	Name        string   `json:"name"`
-	Label       string   `json:"label"`
-	Description string   `json:"description"`
-	Required    bool     `json:"required"`
-	Type        string   `json:"type"`
-	Options     []string `json:"options"`
-	Default     string   `json:"default,omitempty"`
-	MaxFileSize int64    `json:"max_file_size,omitempty"`
+	Name           string   `json:"name"`
+	Label          string   `json:"label"`
+	Description    string   `json:"description"`
+	Required       bool     `json:"required"`
+	Type           string   `json:"type"`
+	Options        []string `json:"options"`
+	Default        string   `json:"default,omitempty"`
+	DefaultDynamic bool     `json:"default_dynamic,omitempty"`
+	MaxFileSize    int64    `json:"max_file_size,omitempty"`
 }
 
 type FlowInputsResp struct {
@@ -423,6 +429,7 @@ func coreFlowInputsToInputs(inputs []models.Input) []FlowInput {
 
 type FlowMeta struct {
 	ID              string     `json:"id"`
+	Version         int        `json:"version"`
 	Name            string     `json:"name" validate:"required,min=1,max=150,alphanum_whitespace"`
 	Description     string     `json:"description" validate:"max=255,no_html"`
 	Prefix          string     `json:"prefix" validate:"omitempty,alphanum_underscore,max=100"`
@@ -431,12 +438,14 @@ type FlowMeta struct {
 	AllowOverlap    bool       `json:"allow_overlap"`
 	UserSchedulable bool       `json:"user_schedulable"`
 	MaxRetries      int        `json:"max_retries" validate:"omitempty,min=0,max=10"`
+	ExecutionMode   string     `json:"execution_mode" validate:"omitempty,oneof=sequential dag"`
 }
 
 func coreSchedulesToSchedules(schedules []models.Schedule) []Schedule {
 	resp := make([]Schedule, len(schedules))
 	for i, s := range schedules {
 		resp[i] = Schedule{
+			Name:     s.Name,
 			Cron:     s.Cron,
 			Timezone: s.Timezone,
 		}
@@ -447,6 +456,7 @@ func coreSchedulesToSchedules(schedules []models.Schedule) []Schedule {
 func coreFlowMetatoFlowMeta(m models.Metadata, schedules []models.Schedule) FlowMeta {
 	return FlowMeta{
 		ID:              m.ID,
+		Version:         m.Version,
 		Name:            m.Name,
 		Description:     m.Description,
 		Prefix:          m.Prefix,
@@ -455,24 +465,29 @@ func coreFlowMetatoFlowMeta(m models.Metadata, schedules []models.Schedule) Flow
 		AllowOverlap:    m.AllowOverlap,
 		UserSchedulable: m.UserSchedulable,
 		MaxRetries:      m.MaxRetries,
+		ExecutionMode:   string(m.ExecutionMode),
 	}
 }
 
 type FlowAction struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Executor string   `json:"executor"`
-	Approval bool     `json:"approval"`
-	On       []string `json:"on"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Executor          string   `json:"executor"`
+	Approval          bool     `json:"approval"`
+	AllowNodeOverride bool     `json:"allow_node_override"`
+	On                []string `json:"on"`
+	Needs             []string `json:"needs,omitempty"`
 }
 
 func coreFlowActiontoFlowAction(a models.Action) FlowAction {
 	return FlowAction{
-		ID:       a.ID,
-		Name:     a.Name,
-		Executor: a.Executor,
-		Approval: a.Approval,
-		On:       a.On,
+		ID:                a.ID,
+		Name:              a.Name,
+		Executor:          a.Executor,
+		Approval:          a.Approval,
+		AllowNodeOverride: a.AllowNodeOverride,
+		On:                a.On,
+		Needs:             a.Needs,
 	}
 }
 
@@ -534,6 +549,23 @@ func coreFlowToFlow(flow models.Flow) FlowListItem {
 	}
 }
 
+func attachNextRuns(items []FlowListItem, nextRuns map[string]models.NextScheduledRun) {
+	for i := range items {
+		if next, ok := nextRuns[items[i].Slug]; ok {
+			items[i].NextRun = &next.At
+			items[i].NextRunName = next.Name
+		}
+	}
+}
+
+func flowSlugs(items []FlowListItem) []string {
+	slugs := make([]string, len(items))
+	for i, item := range items {
+		slugs[i] = item.Slug
+	}
+	return slugs
+}
+
 func coreFlowsToFlows(flows []models.Flow) FlowListResponse {
 	flowItems := make([]FlowListItem, len(flows))
 	for i, flow := range flows {
@@ -551,10 +583,20 @@ type UserProfileResponse struct {
 }
 
 type AppInfoResponse struct {
-	Version         string `json:"version"`
-	Commit          string `json:"commit"`
-	BuildDate       string `json:"build_date"`
-	DefaultTimezone string `json:"default_timezone"`
+	Version         string        `json:"version"`
+	Commit          string        `json:"commit"`
+	BuildDate       string        `json:"build_date"`
+	DefaultTimezone string        `json:"default_timezone"`
+	Branding        *BrandingInfo `json:"branding,omitempty"`
+}
+
+type BrandingInfo struct {
+	AppName      string `json:"app_name,omitempty"`
+	LogoURL      string `json:"logo_url,omitempty"`
+	LogoLightURL string `json:"logo_light_url,omitempty"`
+	IconURL      string `json:"icon_url,omitempty"`
+	FaviconURL   string `json:"favicon_url,omitempty"`
+	HasThemeCSS  bool   `json:"has_theme_css,omitempty"`
 }
 
 func coreUserInfoToUserProfile(u models.UserInfo) UserProfileResponse {
@@ -629,16 +671,50 @@ type ExecutionSummary struct {
 	ID              string          `json:"id"`
 	FlowName        string          `json:"flow_name"`
 	FlowID          string          `json:"flow_id"`
+	FlowVersion     int             `json:"flow_version,omitempty"`   // Version pinned to this execution; omitted for legacy executions.
+	ActiveVersion   int             `json:"active_version,omitempty"` // Flow's currently active version, which may differ from the pinned version.
 	Status          ExecutionStatus `json:"status"`
 	TriggerType     string          `json:"trigger_type"`
-	Input           json.RawMessage `json:"input,omitempty"`
+	ScheduleName    string          `json:"schedule_name,omitempty"`
+	Input           map[string]any  `json:"input,omitempty"`
 	TriggeredBy     string          `json:"triggered_by"`
 	CurrentActionID string          `json:"current_action_id"`
 	CreatedAt       string          `json:"created_at"`
-	StartedAt       string          `json:"started_at"`
-	CompletedAt     string          `json:"completed_at"`
-	ScheduledAt     string          `json:"scheduled_at,omitempty"`
-	ActionRetries   map[string]int  `json:"action_retries,omitempty"`
+	// Omitted rather than sent as "" while an execution is pending or running. The spec
+	// types these as date-time, so an empty string fails to unmarshal in generated
+	// clients, which broke the flow executor's wait-for-child polling.
+	StartedAt     string                 `json:"started_at,omitempty"`
+	CompletedAt   string                 `json:"completed_at,omitempty"`
+	ScheduledAt   string                 `json:"scheduled_at,omitempty"`
+	ActionRetries map[string]int         `json:"action_retries,omitempty"`
+	ActionStates  map[string]ActionState `json:"action_states,omitempty"`
+}
+
+type ActionState struct {
+	Status     string `json:"status"`
+	Attempt    int32  `json:"attempt,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+func coreActionStatesToActionStates(states map[string]execstate.ActionState) map[string]ActionState {
+	if len(states) == 0 {
+		return nil
+	}
+
+	out := make(map[string]ActionState, len(states))
+	for id, s := range states {
+		state := ActionState{Status: string(s.Status), Attempt: s.Attempt, Error: s.Error}
+		if s.StartedAt != nil {
+			state.StartedAt = s.StartedAt.Format(TimeFormat)
+		}
+		if s.FinishedAt != nil {
+			state.FinishedAt = s.FinishedAt.Format(TimeFormat)
+		}
+		out[id] = state
+	}
+	return out
 }
 
 func coreExecutionSummaryToExecutionSummary(e models.ExecutionSummary) ExecutionSummary {
@@ -659,11 +735,14 @@ func coreExecutionSummaryToExecutionSummary(e models.ExecutionSummary) Execution
 
 	return ExecutionSummary{
 		ID:              e.ExecID,
+		FlowVersion:     e.FlowVersion,
+		ActiveVersion:   e.ActiveVersion,
 		FlowName:        e.FlowName,
 		FlowID:          e.FlowID,
 		Status:          ExecutionStatus(e.Status),
-		Input:           e.Input,
+		Input:           e.Inputs,
 		TriggerType:     e.TriggerType,
+		ScheduleName:    e.ScheduleName,
 		TriggeredBy:     e.TriggeredByName,
 		CurrentActionID: e.CurrentActionID,
 		CreatedAt:       e.CreatedAt.Format(TimeFormat),
@@ -671,6 +750,7 @@ func coreExecutionSummaryToExecutionSummary(e models.ExecutionSummary) Execution
 		CompletedAt:     completedAt,
 		ScheduledAt:     scheduledAt,
 		ActionRetries:   e.ActionRetries,
+		ActionStates:    coreActionStatesToActionStates(e.ActionStates),
 	}
 }
 
@@ -689,7 +769,7 @@ type RemoteOptionsReq struct {
 
 type FlowInputReq struct {
 	Name          string            `json:"name" validate:"required,alphanum_underscore,min=1,max=150"`
-	Type          string            `json:"type" validate:"required,oneof=string number password file datetime checkbox select"`
+	Type          string            `json:"type" validate:"required,oneof=string number password file datetime checkbox select node"`
 	Label         string            `json:"label" validate:"omitempty,max=255"`
 	Description   string            `json:"description" validate:"max=255"`
 	Validation    string            `json:"validation"`
@@ -701,13 +781,16 @@ type FlowInputReq struct {
 }
 
 type FlowActionReq struct {
-	Name      string           `json:"name" validate:"required,alphanum_whitespace,min=1,max=150"`
-	Executor  string           `json:"executor"`
-	With      map[string]any   `json:"with" validate:"required"`
-	Approval  bool             `json:"approval"`
-	Variables []map[string]any `json:"variables"`
-	Condition string           `json:"condition"`
-	On        []string         `json:"on"`
+	ID                string           `json:"id,omitempty"`
+	Name              string           `json:"name" validate:"required,alphanum_whitespace,min=1,max=150"`
+	Executor          string           `json:"executor"`
+	With              map[string]any   `json:"with" validate:"required"`
+	Approval          bool             `json:"approval"`
+	AllowNodeOverride bool             `json:"allow_node_override"`
+	Variables         []map[string]any `json:"variables"`
+	Condition         string           `json:"condition"`
+	On                []string         `json:"on"`
+	Needs             []string         `json:"needs"`
 }
 
 type FlowCreateResp struct {
@@ -715,15 +798,19 @@ type FlowCreateResp struct {
 }
 
 type FlowGetReq struct {
-	FlowID string `param:"flowID" validate:"required"`
+	FlowID string `param:"flowID" json:"-" validate:"required"`
 }
 
 type LogStreamingReq struct {
-	LogID string `param:"logID" validate:"required,uuid4"`
+	LogID string `param:"logID" json:"-" validate:"required,uuid4"`
 }
 
 type ExecutionGetReq struct {
-	ExecID string `param:"execID" validate:"required,uuid4"`
+	ExecID string `param:"execID" json:"-" validate:"required,uuid4"`
+}
+
+type RetryExecutionReq struct {
+	FromAction string `json:"from_action,omitempty"`
 }
 
 type FlowUpdateReq struct {
@@ -734,6 +821,7 @@ type FlowUpdateReq struct {
 	UserSchedulable bool            `json:"user_schedulable"`
 	MaxRetries      int             `json:"max_retries" validate:"omitempty,min=0,max=10"`
 	Description     string          `json:"description" validate:"max=255,no_html"`
+	ExecutionMode   string          `json:"execution_mode" validate:"omitempty,oneof=sequential dag"`
 	Inputs          []FlowInputReq  `json:"inputs" validate:"required,dive"`
 	Actions         []FlowActionReq `json:"actions" validate:"required,dive"`
 }
@@ -776,13 +864,15 @@ func convertFlowActionsReqToActions(actionsReq []FlowActionReq) []models.Action 
 		}
 
 		actions[i] = models.Action{
-			ID:        GenerateSlug(action.Name),
-			Name:      action.Name,
-			Executor:  action.Executor,
-			With:      action.With,
-			Approval:  action.Approval,
-			Variables: variables,
-			On:        action.On,
+			ID:                GenerateSlug(action.Name),
+			Name:              action.Name,
+			Executor:          action.Executor,
+			With:              action.With,
+			Approval:          action.Approval,
+			AllowNodeOverride: action.AllowNodeOverride,
+			Variables:         variables,
+			On:                action.On,
+			Needs:             action.Needs,
 		}
 	}
 	return actions
@@ -826,19 +916,22 @@ func convertFlowActionsToActionsReq(actions []models.Action) []FlowActionReq {
 		}
 
 		actionsReq[i] = FlowActionReq{
-			Name:      action.Name,
-			Executor:  action.Executor,
-			With:      action.With,
-			Approval:  action.Approval,
-			Variables: variables,
-			On:        action.On,
+			ID:                action.ID,
+			Name:              action.Name,
+			Executor:          action.Executor,
+			With:              action.With,
+			Approval:          action.Approval,
+			AllowNodeOverride: action.AllowNodeOverride,
+			Variables:         variables,
+			On:                action.On,
+			Needs:             action.Needs,
 		}
 	}
 	return actionsReq
 }
 
 type FlowSecretReq struct {
-	FlowID      string `param:"flowID" validate:"required"`
+	FlowID      string `param:"flowID" json:"-" validate:"required"`
 	Key         string `json:"key" validate:"required,min=1,max=150,alphanum_underscore"`
 	Value       string `json:"value" validate:"required"`
 	Description string `json:"description" validate:"max=255"`
@@ -853,7 +946,7 @@ type FlowSecretResp struct {
 }
 
 type FlowSecretGetReq struct {
-	SecretID string `param:"secretID" validate:"required"`
+	SecretID string `param:"secretID" json:"-" validate:"required"`
 }
 
 type FlowSecretUpdateReq struct {
@@ -863,7 +956,7 @@ type FlowSecretUpdateReq struct {
 }
 
 type FlowSecretsListReq struct {
-	FlowID string `param:"flowID" validate:"required"`
+	FlowID string `param:"flowID" json:"-" validate:"required"`
 }
 
 func coreFlowSecretToFlowSecretResp(secret models.FlowSecret) FlowSecretResp {
@@ -891,7 +984,7 @@ type NamespaceSecretResp struct {
 }
 
 type NamespaceSecretGetReq struct {
-	SecretID string `param:"secretID" validate:"required"`
+	SecretID string `param:"secretID" json:"-" validate:"required"`
 }
 
 type NamespaceSecretUpdateReq struct {
@@ -916,28 +1009,31 @@ type FlowCancellationResp struct {
 }
 
 type ScheduleCreateReq struct {
-	FlowID   string                 `param:"flowID" validate:"required"`
+	FlowID   string                 `param:"flowID" json:"-" validate:"required"`
+	Name     string                 `json:"name" validate:"max=150"`
 	Cron     string                 `json:"cron" validate:"required,cron"`
 	Timezone string                 `json:"timezone" validate:"required,timezone"`
 	Inputs   map[string]interface{} `json:"inputs" validate:"required"`
 }
 
 type ScheduleUpdateReq struct {
-	FlowID     string                 `param:"flowID" validate:"required"`
-	ScheduleID string                 `param:"schedule_id" validate:"required,uuid4"`
-	Cron       string                 `json:"cron" validate:"required,cron"`
-	Timezone   string                 `json:"timezone" validate:"required,timezone"`
-	Inputs     map[string]interface{} `json:"inputs" validate:"required"`
-	IsActive   bool                   `json:"is_active"`
+	FlowID     string `param:"flowID" json:"-" validate:"required"`
+	ScheduleID string `param:"schedule_id" json:"-" validate:"required,uuid4"`
+	// Name is optional: when the key is absent the existing name is kept.
+	Name     *string                `json:"name" validate:"omitempty,max=150"`
+	Cron     string                 `json:"cron" validate:"required,cron"`
+	Timezone string                 `json:"timezone" validate:"required,timezone"`
+	Inputs   map[string]interface{} `json:"inputs" validate:"required"`
+	IsActive bool                   `json:"is_active"`
 }
 
 type ScheduleGetReq struct {
-	FlowID     string `param:"flowID" validate:"required"`
-	ScheduleID string `param:"schedule_id" validate:"required,uuid4"`
+	FlowID     string `param:"flowID" json:"-" validate:"required"`
+	ScheduleID string `param:"schedule_id" json:"-" validate:"required,uuid4"`
 }
 
 type ScheduleListReq struct {
-	FlowID string `param:"flowID" validate:"required"`
+	FlowID string `param:"flowID" json:"-" validate:"required"`
 	Page   int    `query:"page"`
 	Count  int    `query:"count_per_page"`
 }
@@ -950,6 +1046,7 @@ type ScheduleResp struct {
 	UUID          string                 `json:"uuid"`
 	FlowSlug      string                 `json:"flow_slug"`
 	FlowName      string                 `json:"flow_name"`
+	Name          string                 `json:"name"`
 	Cron          string                 `json:"cron"`
 	Timezone      string                 `json:"timezone"`
 	Inputs        map[string]interface{} `json:"inputs"`
@@ -971,6 +1068,7 @@ func coreScheduleToScheduleResp(s models.Schedule) ScheduleResp {
 		UUID:          s.UUID,
 		FlowSlug:      s.FlowSlug,
 		FlowName:      s.FlowName,
+		Name:          s.Name,
 		Cron:          s.Cron,
 		Timezone:      s.Timezone,
 		Inputs:        s.Inputs,
@@ -1047,4 +1145,30 @@ type APITokenCreateReq struct {
 type APITokenCreateResp struct {
 	models.APIToken
 	Token string `json:"token"`
+}
+
+type FlowVersionListItem struct {
+	Version   int    `json:"version"`
+	Checksum  string `json:"checksum"`
+	CreatedAt string `json:"created_at"`
+	Active    bool   `json:"active"`
+}
+
+type FlowVersionsResp struct {
+	Versions   []FlowVersionListItem `json:"versions"`
+	PageCount  int64                 `json:"page_count"`
+	TotalCount int64                 `json:"total_count"`
+}
+
+type FlowVersionResp struct {
+	Version   int    `json:"version"`
+	Format    string `json:"format"`
+	Source    string `json:"source"`
+	CreatedAt string `json:"created_at"`
+	Active    bool   `json:"active"`
+}
+
+type FlowVersionActivateResp struct {
+	ID      string `json:"id"`
+	Version int    `json:"version"`
 }

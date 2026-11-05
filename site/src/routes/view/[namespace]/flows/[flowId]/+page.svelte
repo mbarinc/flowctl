@@ -8,7 +8,7 @@
     import Tabs from "$lib/components/shared/Tabs.svelte";
     import Pagination from "$lib/components/shared/Pagination.svelte";
     import FlowHero from "$lib/components/flows/FlowHero.svelte";
-    import FlowActionsSummary from "$lib/components/flow-input/FlowActionsSummary.svelte";
+    import PipelineGraph from "$lib/components/flow-status/PipelineGraph.svelte";
     import FlowSchedulesList from "$lib/components/flows/FlowSchedulesList.svelte";
     import ScheduledExecutionsList from "$lib/components/flows/ScheduledExecutionsList.svelte";
     import { handleInlineError } from "$lib/utils/errorHandling";
@@ -16,9 +16,13 @@
     import type { TableColumn, ScheduledExecution } from "$lib/types";
     import { DEFAULT_PAGE_SIZE } from "$lib/constants";
     import { permissionChecker } from "$lib/utils/permissions";
-    import { formatDateTime, getStartTime } from "$lib/utils";
+    import { formatDateTime, formatDuration, getStartTime } from "$lib/utils";
+    import { actionStages } from "$lib/utils/dag";
     import { apiClient } from "$lib/apiClient";
-    import { IconPencil, IconEye, IconInfoCircle, IconX } from "@tabler/icons-svelte";
+    import IconPencil from "@tabler/icons-svelte/icons/pencil";
+    import IconEye from "@tabler/icons-svelte/icons/eye";
+    import IconInfoCircle from "@tabler/icons-svelte/icons/info-circle";
+    import IconX from "@tabler/icons-svelte/icons/x";
     import LinkCell from "$lib/components/shared/cells/LinkCell.svelte";
     import MutedTextCell from "$lib/components/shared/cells/MutedTextCell.svelte";
     import UserAvatarCell from "$lib/components/shared/cells/UserAvatarCell.svelte";
@@ -26,7 +30,7 @@
 
     let { data }: { data: PageData } = $props();
 
-    let activeTab = $state<"run" | "schedules" | "history">("run");
+    let activeTab = $state<"run" | "pipeline" | "schedule" | "history">("run");
     let historyLoading = $state(false);
     let flowExecutions = $state<any[]>([]);
     let historyCurrentPage = $state(1);
@@ -39,11 +43,22 @@
         data.flowMeta?.scheduled_executions || [],
     );
     let userSchedules = $state<any[]>(data.userSchedules || []);
+    let scheduleCurrentPage = $state(1);
+    let schedulePageCount = $state(data.userSchedulesPageCount || 1);
+    let scheduleTotalCount = $state(data.userSchedulesTotalCount || 0);
+    let schedulesLoading = $state(false);
+    let upcomingSchedules = $state<any[]>(data.upcomingSchedules || []);
+    let upcomingCurrentPage = $state(1);
+    let upcomingPageCount = $state(data.upcomingSchedulesPageCount || 1);
+    let upcomingLoading = $state(false);
 
     let namespace = $derived(page.params.namespace!);
     let encodedNamespace = $derived(encodeURIComponent(namespace));
     let flowId = $derived(page.params.flowId);
     let rerunFromExecId = $derived(data.rerunFromExecId);
+    let actions = $derived(data.flowMeta?.actions || []);
+    let isDAG = $derived(data.flowMeta?.meta?.execution_mode === "dag");
+    let stageCount = $derived(actionStages(actions, isDAG ? "dag" : "sequential").length);
     let showRerunBanner = $state(!!rerunFromExecId);
 
     // Check update and view_config permissions on mount
@@ -55,16 +70,43 @@
     );
 
     // Reload schedules after updates
-    const reloadSchedules = async () => {
+    const reloadSchedules = async (page = scheduleCurrentPage) => {
+        schedulesLoading = true;
         try {
-            const res = await apiClient.flows.schedules.list(
-                namespace!,
-                flowId!,
-            );
+            const res = await apiClient.flows.schedules.list(namespace!, flowId!, { page, count_per_page: 10 });
+            if (!res.schedules?.length && page > 1) {
+                return await reloadSchedules(page - 1);
+            }
             userSchedules = res.schedules || [];
+            schedulePageCount = res.page_count || 1;
+            scheduleTotalCount = res.total_count || 0;
+            scheduleCurrentPage = page;
         } catch (error) {
             handleInlineError(error, "Failed to reload schedules");
+        } finally {
+            schedulesLoading = false;
         }
+    };
+
+    const reloadUpcomingSchedules = async (page = upcomingCurrentPage) => {
+        upcomingLoading = true;
+        try {
+            const res = await apiClient.flows.schedules.list(namespace!, flowId!, { page, count_per_page: 5 });
+            if (!res.schedules?.length && page > 1) {
+                return await reloadUpcomingSchedules(page - 1);
+            }
+            upcomingSchedules = res.schedules || [];
+            upcomingPageCount = res.page_count || 1;
+            upcomingCurrentPage = page;
+        } catch (error) {
+            handleInlineError(error, "Failed to reload upcoming schedules");
+        } finally {
+            upcomingLoading = false;
+        }
+    };
+
+    const handleSchedulesUpdate = async () => {
+        await Promise.all([reloadSchedules(), reloadUpcomingSchedules()]);
     };
 
     const refreshScheduledExecutions = async () => {
@@ -118,28 +160,6 @@
         goToHistoryPage(event.detail.page);
     };
 
-    const formatDuration = (startedAt: string, completedAt?: string) => {
-        if (!startedAt) return "Unknown";
-
-        const start = new Date(startedAt);
-        const end = completedAt ? new Date(completedAt) : new Date();
-        const durationMs = end.getTime() - start.getTime();
-
-        if (durationMs < 1000) return "<1s";
-
-        const seconds = Math.floor(durationMs / 1000);
-        const minutes = Math.floor(seconds / 60);
-        const hours = Math.floor(minutes / 60);
-
-        if (hours > 0) {
-            return `${hours}h ${minutes % 60}m`;
-        } else if (minutes > 0) {
-            return `${minutes}m ${seconds % 60}s`;
-        } else {
-            return `${seconds}s`;
-        }
-    };
-
     // Watch for tab changes and load history when needed
     $effect(() => {
         if (activeTab === "history") {
@@ -185,16 +205,21 @@
             key: "trigger_type",
             header: "Trigger Type",
             component: BadgeCell,
-            componentProps: { variant: (row: any) => row.trigger_type === "manual" ? "" : "success" }
+            componentProps: {
+                variant: (row: any) => row.trigger_type === "manual" ? "primary" : "success",
+                tooltip: (row: any) =>
+                    row.trigger_type === "scheduled" ? row.schedule_name || undefined : undefined
+            }
         },
     ];
 
     // Tab configuration
-    const tabs = [
+    let tabs = $derived([
         { id: "run", label: "Run" },
+        { id: "pipeline", label: "Pipeline" },
         { id: "schedule", label: "Schedule" },
         { id: "history", label: "History" },
-    ];
+    ]);
 </script>
 
 <svelte:head>
@@ -237,11 +262,13 @@
 
 <div class="flow-header">
     <FlowHero
+        version={data.flowMeta?.meta?.version}
+        versionsUrl={canViewFlowConfig ? `/view/${encodedNamespace}/flows/${flowId}/versions` : undefined}
         name={data.flowMeta?.meta?.name || "Loading..."}
         description={data.flowMeta?.meta?.description || ""}
     />
     <div class="tab-bar">
-        <div class="tab-bar-inner">
+        <div class="container" style="--container-max: 72rem; --container-pad: 0">
             <Tabs {tabs} bind:activeTab />
         </div>
     </div>
@@ -250,53 +277,95 @@
 <!-- Tab Content -->
 <div class="tab-content">
     {#if activeTab === "run"}
-        <div class="run-layout">
-            <div class="run-main">
-                {#if showRerunBanner}
-                    <div class="mb-4">
-                        <div role="alert" class="hstack gap-2 items-start justify-between">
-                            <div class="hstack gap-2 flex-1 items-start">
-                                <IconInfoCircle size={20} style="color: var(--primary); margin-top: 0.125rem; flex-shrink: 0" />
-                                <div class="flex-1">
-                                    <h3 class="text-sm font-medium">Rerunning execution</h3>
-                                    <p class="text-sm text-light mt-2">
-                                        Inputs have been prepopulated from execution
-                                        <a href="/view/{encodedNamespace}/results/{flowId}/{rerunFromExecId}" class="font-mono">
-                                            {rerunFromExecId.substring(0, 8)}
-                                        </a>
-                                    </p>
-                                </div>
-                            </div>
-                            <button onclick={() => (showRerunBanner = false)} class="ghost icon small" aria-label="Dismiss">
-                                <IconX size={20} />
-                            </button>
+        <div class="container" style="--container-max: 52rem; --container-pad: 0">
+            {#if data.rerunVersion && data.flowMeta?.meta?.version && data.rerunVersion !== data.flowMeta.meta.version}
+                <div role="alert" data-variant="warning" class="mb-4">
+                    <div>
+                        <strong>Flow version changed.</strong>
+                        The previous execution used version {data.rerunVersion}.
+                        This run will use version {data.flowMeta.meta.version}.
+                    </div>
+                </div>
+            {/if}
+
+            {#if showRerunBanner && rerunFromExecId}
+                <div role="alert" class="mb-4 hstack gap-2 items-start justify-between">
+                    <div class="hstack gap-2 flex-1 items-start">
+                        <IconInfoCircle size={20} style="color: var(--primary)" />
+                        <div class="flex-1">
+                            <h3 class="text-sm font-medium">Rerunning execution</h3>
+                            <p class="text-sm text-light mt-2">
+                                Inputs have been prepopulated from execution
+                                <a href="/view/{encodedNamespace}/results/{flowId}/{rerunFromExecId}" class="font-mono">
+                                    {rerunFromExecId.substring(0, 8)}
+                                </a>
+                            </p>
                         </div>
                     </div>
+                    <button onclick={() => (showRerunBanner = false)} class="ghost icon small" aria-label="Dismiss">
+                        <IconX size={20} />
+                    </button>
+                </div>
+            {/if}
+
+            <FlowInputForm
+                inputs={data.flowInputs || []}
+                namespace={namespace!}
+                flowId={flowId!}
+                executionInput={data.executionInput}
+                optionsRequestId={data.optionsRequestId}
+                onScheduled={refreshScheduledExecutions}
+            />
+        </div>
+    {/if}
+
+    <!-- Pipeline Tab -->
+    {#if activeTab === "pipeline"}
+        <div
+            role="tabpanel"
+            class="container"
+            style="--container-max: 72rem; --container-pad: 0"
+        >
+            <article class="card flush">
+                <header
+                    class="p-4 hstack justify-between"
+                    style="border-block-end: 1px solid var(--border)"
+                >
+                    <span class="badge primary">{isDAG ? "dag" : "sequential"}</span>
+                    <span class="text-lighter text-xs">
+                        {actions.length} {actions.length === 1 ? "action" : "actions"}
+                        {#if isDAG}
+                            · {stageCount} {stageCount === 1 ? "step" : "steps"}
+                        {:else}
+                            · one after another
+                        {/if}
+                    </span>
+                </header>
+                {#if actions.length > 0}
+                    <PipelineGraph
+                        {actions}
+                        executionMode={isDAG ? "dag" : "sequential"}
+                    />
+                {:else}
+                    <p class="p-4 text-light text-sm">This flow has no actions.</p>
                 {/if}
-                <FlowInputForm
-                    inputs={data.flowInputs || []}
-                    namespace={namespace!}
-                    flowId={flowId!}
-                    executionInput={data.executionInput}
-                    optionsRequestId={data.optionsRequestId}
-                    onScheduled={refreshScheduledExecutions}
-                />
-            </div>
-            <div class="run-aside">
-                <FlowActionsSummary actions={data.flowMeta?.actions || []} />
-            </div>
+            </article>
         </div>
     {/if}
 
     <!-- Schedules Tab -->
     {#if activeTab === "schedule"}
-        <div class="content-wide">
+        <div class="container" style="--container-max: 64rem; --container-pad: 0">
             <div class="vstack gap-4">
                 <ScheduledExecutionsList
-                    schedules={scheduledExecutions}
-                    cronSchedules={userSchedules}
+                    schedules={upcomingCurrentPage === 1 ? scheduledExecutions : []}
+                    cronSchedules={upcomingSchedules}
                     namespace={namespace!}
                     flowId={flowId!}
+                    currentPage={upcomingCurrentPage}
+                    totalPages={upcomingPageCount}
+                    loading={upcomingLoading}
+                    onPageChange={reloadUpcomingSchedules}
                 />
 
                 <FlowSchedulesList
@@ -307,17 +376,21 @@
                         false}
                     user={data.user}
                     schedules={userSchedules}
-                    onUpdate={reloadSchedules}
+                    totalCount={scheduleTotalCount}
+                    onUpdate={handleSchedulesUpdate}
                     {canUpdateFlow}
+                    currentPage={scheduleCurrentPage}
+                    totalPages={schedulePageCount}
+                    loading={schedulesLoading}
+                    onPageChange={reloadSchedules}
                 />
-
             </div>
         </div>
     {/if}
 
     <!-- History Tab -->
     {#if activeTab === "history"}
-        <div class="content-max">
+        <div class="container" style="--container-max: 72rem; --container-pad: 0">
             <Table
                 columns={tableColumns}
                 data={flowExecutions}
@@ -360,46 +433,11 @@
         padding: 0 var(--space-6);
     }
 
-    .tab-bar-inner {
-        max-width: 72rem;
-        margin: 0 auto;
-    }
-
     .tab-content {
         padding: var(--space-6);
     }
 
-    .run-layout {
-        display: grid;
-        grid-template-columns: 1fr 20rem;
-        gap: var(--space-6);
-        max-width: 72rem;
-        margin: 0 auto;
-    }
-
-    .run-main {
-        min-width: 0;
-    }
-
-    .run-aside {
-        position: sticky;
-        top: var(--space-6);
-        align-self: start;
-    }
-
-    .content-wide {
-        max-width: 64rem;
-        margin: 0 auto;
-    }
-
-    .content-max {
-        max-width: 72rem;
-        margin: 0 auto;
-    }
-
-    @media (max-width: 768px) {
-        .run-layout {
-            grid-template-columns: 1fr;
-        }
+    .card.flush {
+        padding: 0;
     }
 </style>
